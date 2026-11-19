@@ -38,9 +38,11 @@ test("the script loads only in production for a visitor who didn't opt out", () 
   assert.equal(shouldLoad("sayfold.brightloopapps.com", { globalPrivacyControl: true }, {}), false);
 });
 
-test("the allow-list: a pageview, a recording started, and a transcript ready with only its length bucket and backend", () => {
+test("the allow-list: a pageview, a recording started, a transcript ready with only its length bucket and backend, and an idea sent with nothing at all", () => {
   assert.equal(PROJECT, "sayfold");
-  assert.deepEqual(Object.keys(EVENTS).sort(), ["$pageview", "play_finished", "play_started"]);
+  assert.deepEqual(Object.keys(EVENTS).sort(), ["$pageview", "idea_sent", "play_finished", "play_started"]);
+  // Sending says only that an idea went: never the repo, token, labels, title or text.
+  assert.deepEqual(EVENTS.idea_sent, {});
   assert.deepEqual(EVENTS.$pageview, {});
   assert.deepEqual(EVENTS.play_started, {});
   assert.deepEqual(EVENTS.play_finished, {

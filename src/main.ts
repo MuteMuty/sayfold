@@ -2,17 +2,19 @@ import "./style.css";
 import { Recorder, type Recording } from "./audio/recorder.ts";
 import { Speech } from "./stt/client.ts";
 import { clock, MAX_SECONDS } from "./core/time.ts";
-import { titleFrom, clipboardText } from "./core/title.ts";
+import { titleFrom, copyNote } from "./core/title.ts";
 import { micProblem, unsupported, MESSAGES, type Problem } from "./core/mic.ts";
 import { LoadProgress, megabytes } from "./core/progress.ts";
 import { MODEL } from "./stt/model.ts";
 import { Likes, likeLabel, shortCount } from "./core/likes.ts";
 import { loadAnalytics, track } from "./analytics.ts";
 import { EVENTS, playEvents, PROJECT, type Backend } from "./analytics-events.ts";
+import { connect, send, issueFrom, parseRepo, preselected, repoName, sendButton, tokenProblem, type GitHubProblem, type Label } from "./core/github.ts";
+import { GitHubLink } from "./core/token.ts";
 
 const $ = <T extends HTMLElement = HTMLElement>(sel: string) => document.querySelector<T>(sel)!;
 
-type State = "idle" | "starting" | "recording" | "working" | "review" | "problem";
+type State = "idle" | "starting" | "recording" | "working" | "review" | "problem" | "sent";
 let state: State = "idle";
 
 const recBtn = $<HTMLButtonElement>("#rec");
@@ -136,7 +138,12 @@ let last: Recording | null = null;
 let levels: number[] = [];
 
 async function start() {
-  if (state === "starting" || state === "recording" || state === "working") return;
+  // While an idea is on its way to GitHub, its answer decides what comes next.
+  if (state === "starting" || state === "recording" || state === "working" || sending) return;
+  // Never two microphones at once: let go of any earlier one first.
+  const previous = recorder;
+  recorder = null;
+  if (previous) void previous.stop();
   setState("starting");
   say("Asking for the microphone");
   // First use: the model starts loading now, while you talk.
@@ -151,6 +158,7 @@ async function start() {
   last = null;
   levels = [];
   plays.started();
+  hideSendProblem();
   setState("recording");
   say("Recording. Press Stop when you're done.");
   recBtn.focus();
@@ -163,6 +171,8 @@ async function stop(capped = false) {
   recorder = null;
   setState("working");
   last = await r.stop();
+  // The last frame drawn may have been just before the cap: end on the recording's real length (2:00 at the cap).
+  clockNow.textContent = clock(last.seconds);
   if (capped) toast(`Stopped at ${clock(MAX_SECONDS)}, the limit for one recording.`);
   await transcribe();
 }
@@ -203,6 +213,8 @@ function showReview(text: string) {
   say("Your idea is ready to review");
   textIn.focus();
   textIn.setSelectionRange(text.length, text.length);
+  renderSend();
+  if (link.current && !labels) void loadLabels();
 }
 
 textIn.addEventListener("input", () => {
@@ -213,15 +225,18 @@ titleIn.addEventListener("input", () => {
 });
 
 $("#copy").addEventListener("click", async () => {
+  const note = copyNote(titleIn.value, textIn.value);
+  if (!note.text) return toast(note.message);
   try {
-    await navigator.clipboard.writeText(clipboardText(titleIn.value, textIn.value));
-    toast("Copied the title and text");
+    await navigator.clipboard.writeText(note.text);
+    toast(note.message);
   } catch {
     toast("Couldn't copy. Select the text and copy it yourself.");
   }
 });
 
 $("#again").addEventListener("click", () => void start());
+$("#next").addEventListener("click", () => void start());
 
 recBtn.addEventListener("click", () => {
   if (state === "recording") void stop();
@@ -230,10 +245,10 @@ recBtn.addEventListener("click", () => {
 
 // Space starts and stops a recording from anywhere on the page, except where it types or presses something.
 window.addEventListener("keydown", (e) => {
-  if (e.code !== "Space" || e.repeat || e.ctrlKey || e.metaKey || e.altKey) return;
+  if (e.code !== "Space" || e.repeat || e.ctrlKey || e.metaKey || e.altKey || ghDialog.open) return;
   const t = e.target as HTMLElement | null;
   if (t?.closest("button, a, input, textarea, select, [contenteditable]")) return;
-  if (state === "idle" || state === "recording") {
+  if (state === "idle" || state === "recording" || state === "sent") {
     e.preventDefault();
     if (state === "recording") void stop();
     else void start();
@@ -297,6 +312,258 @@ function frame(now: number) {
 
 new ResizeObserver(() => draw()).observe(wave);
 
+// --- GitHub: connect, labels, send -----------------------------------------------------------------
+// GitHub is the API: the visitor's own fine-grained token, limited to one repo, sends the idea straight
+// from this browser to api.github.com as an issue (core/github.ts). The token stays in this tab's memory,
+// unless they tick "Remember on this device" (core/token.ts). The page's Content-Security-Policy lets
+// nothing else be reached (src/csp.ts).
+let localStore: Storage | null = null;
+try {
+  localStore = window.localStorage;
+} catch {
+  // Storage blocked: a like, and a token, still work within this page.
+}
+const link = new GitHubLink(localStore);
+/** The connected repo's labels (null until loaded), and the ones chosen for the next idea. */
+let labels: Label[] | null = null;
+let chosen = new Set<string>();
+let sending = false;
+const online = () => navigator.onLine !== false;
+
+const ghDialog = $<HTMLDialogElement>("#gh");
+const ghForm = $<HTMLFormElement>("#gh-form");
+const ghRepo = $<HTMLInputElement>("#gh-repo");
+const ghToken = $<HTMLInputElement>("#gh-token");
+const ghRemember = $<HTMLInputElement>("#gh-remember");
+const ghConnect = $<HTMLButtonElement>("#gh-connect");
+const ghErr = $("#gh-err");
+const sendBtn = $<HTMLButtonElement>("#send");
+const labelsBox = $<HTMLFieldSetElement>("#labels");
+const chips = $("#chips");
+const sendProblem = $("#send-problem");
+const sendProblemText = $("#send-problem-text");
+let opener: HTMLElement | null = null;
+let checking = false;
+
+/** The header button, the line under Send, and the connected view in the dialog. */
+function renderLink() {
+  const c = link.current;
+  const name = c ? repoName(c.repo) : "";
+  $("#gh-open-label").textContent = c ? name : "Connect GitHub";
+  $("#gh-open").setAttribute("aria-label", c ? `GitHub: sending to ${name}` : "Connect GitHub");
+  document.body.dataset.github = c ? "on" : "off";
+  $("#send-to").textContent = c ? `As an issue in ${name}.` : "Connect a repo of yours first. The idea becomes an issue there.";
+  const repoLink = $<HTMLAnchorElement>("#gh-on-repo");
+  repoLink.textContent = name;
+  repoLink.href = c ? `https://github.com/${name}/issues` : "https://github.com";
+  $("#gh-on-keep").textContent = link.remembered
+    ? "Your token is remembered on this device until you forget it."
+    : "Your token is kept in this tab's memory only, and gone when you close it.";
+  renderLabels();
+  renderSend();
+}
+
+function renderLabels() {
+  const list = link.current ? labels ?? [] : [];
+  chips.replaceChildren(
+    ...list.map((l) => {
+      const chip = document.createElement("label");
+      chip.className = "chip";
+      const box = Object.assign(document.createElement("input"), { type: "checkbox", value: l.name, checked: chosen.has(l.name) });
+      box.addEventListener("change", () => (box.checked ? chosen.add(l.name) : chosen.delete(l.name)));
+      const dot = document.createElement("span");
+      dot.className = "chip-dot";
+      if (l.color) dot.style.setProperty("--c", l.color);
+      const text = document.createElement("span");
+      text.textContent = l.name;
+      chip.append(box, dot, text);
+      return chip;
+    }),
+  );
+  labelsBox.hidden = list.length === 0;
+}
+
+function renderSend() {
+  const b = sendButton({ online: online(), busy: sending });
+  sendBtn.textContent = b.label;
+  sendBtn.disabled = b.disabled;
+  sendBtn.toggleAttribute("aria-busy", sending);
+  // Nothing else starts until GitHub answers.
+  for (const id of ["#copy", "#again"]) $<HTMLButtonElement>(id).disabled = sending;
+  ghConnect.textContent = checking ? "Checking…" : online() ? "Connect" : "Waiting for a connection…";
+  ghConnect.disabled = checking || !online();
+}
+
+/** What's said under Send now, so the offline note can go when the connection is back. */
+let sendProblemKind: GitHubProblem["kind"] | null = null;
+function showSendProblem(p: GitHubProblem) {
+  sendProblemKind = p.kind;
+  sendProblem.hidden = false;
+  sendProblemText.textContent = `${p.message} Your text is still here.`;
+  $("#send-reconnect").hidden = !p.reconnect;
+}
+function hideSendProblem() {
+  sendProblemKind = null;
+  sendProblem.hidden = true;
+  sendProblemText.textContent = "";
+}
+
+function setLabels(list: Label[]) {
+  const known = new Set(list.map((l) => l.name));
+  const kept = [...chosen].filter((n) => known.has(n));
+  labels = list;
+  // `idea` at first; after that, whatever was chosen last time, as long as the repo still has it.
+  chosen = new Set(kept.length || chosen.size ? kept : preselected(list));
+  renderLabels();
+}
+
+/** A remembered connection reads the repo's labels when the first idea is ready to review. */
+async function loadLabels() {
+  const c = link.current;
+  if (!c) return;
+  const r = await connect((...a) => fetch(...a), c.repo, c.token, { online });
+  if (link.current !== c) return;
+  if (r.ok) {
+    setLabels(r.labels);
+  } else if (state === "review") showSendProblem(r.problem);
+}
+
+function openGitHub(mode: "form" | "on" = link.current ? "on" : "form") {
+  opener = document.activeElement as HTMLElement | null;
+  ghDialog.dataset.mode = mode;
+  ghDialog.setAttribute("aria-labelledby", mode === "on" ? "gh-on-h" : "gh-h");
+  if (mode === "form") {
+    if (link.current && !ghRepo.value) ghRepo.value = repoName(link.current.repo);
+    ghRemember.checked = link.remembered;
+    renderKeep();
+  }
+  renderLink();
+  if (!ghDialog.open) ghDialog.showModal();
+  (mode === "on" ? $("#gh-done") : ghRepo.value ? ghToken : ghRepo).focus();
+}
+
+function closeGitHub() {
+  ghDialog.close();
+}
+ghDialog.addEventListener("close", () => {
+  for (const id of ["#gh-repo-err", "#gh-token-err", "#gh-err", "#gh-note"]) $(id).textContent = "";
+  ghToken.value = "";
+  // Back where the visitor was, or on Send once they've connected from it.
+  const back = opener?.isConnected && !opener.closest("dialog") && getComputedStyle(opener).display !== "none" ? opener : null;
+  back?.focus();
+});
+
+const renderKeep = () => {
+  $("#gh-keep").textContent = ghRemember.checked
+    ? "Kept in this browser's storage on this device until you press Forget token. Anyone using this device could use it."
+    : "Kept in this tab's memory only, and gone when you close it.";
+};
+ghRemember.addEventListener("change", renderKeep);
+// A field's own error goes as soon as it's edited.
+for (const [field, err] of [[ghRepo, "#gh-repo-err"], [ghToken, "#gh-token-err"]] as const) {
+  field.addEventListener("input", () => {
+    $(err).textContent = "";
+    field.removeAttribute("aria-invalid");
+  });
+}
+
+ghForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  if (checking || !online()) return;
+  const repo = parseRepo(ghRepo.value);
+  const tokenErr = tokenProblem(ghToken.value);
+  $("#gh-repo-err").textContent = repo ? "" : "Enter the repo as owner/name, or paste its github.com link.";
+  $("#gh-token-err").textContent = tokenErr ?? "";
+  ghErr.textContent = "";
+  $("#gh-note").textContent = "";
+  ghRepo.setAttribute("aria-invalid", String(!repo));
+  ghToken.setAttribute("aria-invalid", String(!!tokenErr));
+  if (!repo) return ghRepo.focus();
+  if (tokenErr) return ghToken.focus();
+  const token = ghToken.value.trim();
+  checking = true;
+  renderSend();
+  const r = await connect((...a) => fetch(...a), repo, token, { online });
+  checking = false;
+  renderSend();
+  if (!r.ok) {
+    ghErr.textContent = r.problem.message;
+    (r.problem.kind === "token" ? ghToken : r.problem.kind === "missing" ? ghRepo : ghConnect).focus();
+    return;
+  }
+  const changed = !link.current || repoName(link.current.repo) !== repoName(r.repo);
+  link.set({ repo: r.repo, token }, ghRemember.checked);
+  if (changed) chosen = new Set();
+  setLabels(r.labels);
+  ghRepo.value = repoName(r.repo);
+  hideSendProblem();
+  renderLink();
+  if (state === "review") opener = sendBtn;
+  closeGitHub();
+  say(`Connected to ${repoName(r.repo)}. Ideas you send become issues there.`);
+});
+
+$("#gh-cancel").addEventListener("click", closeGitHub);
+$("#gh-done").addEventListener("click", closeGitHub);
+$("#gh-open").addEventListener("click", () => openGitHub());
+$("#send-reconnect").addEventListener("click", () => openGitHub("form"));
+
+// Forget token: out of this tab's memory and off this device, in one click.
+$("#gh-forget").addEventListener("click", () => {
+  link.forget();
+  labels = null;
+  chosen = new Set();
+  ghToken.value = "";
+  hideSendProblem();
+  openGitHub("form");
+  ghErr.textContent = "";
+  $("#gh-note").textContent = "Token forgotten. It's gone from this tab and this device.";
+});
+
+sendBtn.addEventListener("click", async () => {
+  const c = link.current;
+  if (!c) return openGitHub("form");
+  if (sending || !online()) return;
+  const issue = issueFrom(titleIn.value, textIn.value, [...chosen].filter((n) => labels?.some((l) => l.name === n)));
+  if (!issue) {
+    sendProblem.hidden = false;
+    sendProblemText.textContent = "There's nothing to send yet. Say or type your idea first.";
+    $("#send-reconnect").hidden = true;
+    return;
+  }
+  hideSendProblem();
+  sending = true;
+  renderSend();
+  say("Sending to GitHub");
+  const r = await send((...a) => fetch(...a), c.repo, c.token, issue, { online });
+  sending = false;
+  renderSend();
+  const where = r.ok ? (r.number ? `issue #${r.number} in ${repoName(c.repo)}` : `an issue in ${repoName(c.repo)}`) : "";
+  if (r.ok) track("idea_sent");
+  // Only the review screen moves on with the answer; anywhere else it's just a note.
+  if (state !== "review") return toast(r.ok ? `Sent to GitHub as ${where}.` : r.problem.message);
+  if (!r.ok) {
+    showSendProblem(r.problem);
+    // Back on Send (or on the problem, while Send waits for a connection), not at the top of the page.
+    (sendBtn.disabled ? sendProblemText : sendBtn).focus();
+    return;
+  }
+  const a = $<HTMLAnchorElement>("#sent-link");
+  a.href = r.url;
+  a.textContent = where;
+  setState("sent");
+  say(`Sent to GitHub as ${a.textContent}`);
+  $("#next").focus();
+});
+
+// Sending waits while the browser is offline, and the button comes back by itself with the connection.
+addEventListener("online", () => {
+  if (sendProblemKind === "offline") hideSendProblem();
+  renderSend();
+});
+addEventListener("offline", renderSend);
+renderLink();
+
 // --- what this browser can do ------------------------------------------------------------------
 const lacking = unsupported({
   isSecureContext: window.isSecureContext,
@@ -313,15 +580,9 @@ else setState("idle");
 // A heart with the live count from the lab hub (see core/likes.ts). It stays hidden until the
 // count loads and recording never waits for it.
 const likeBtn = $<HTMLButtonElement>("#like");
-let likeStore: Storage | null = null;
-try {
-  likeStore = window.localStorage;
-} catch {
-  // Storage blocked: a like still works within this page.
-}
 const likes = new Likes({
   fetch: (...a) => fetch(...a),
-  storage: likeStore,
+  storage: localStore,
   onChange(s) {
     likeBtn.hidden = !s.ready;
     likeBtn.setAttribute("aria-pressed", String(s.liked));
@@ -346,11 +607,12 @@ loadAnalytics(PROJECT, EVENTS);
 
 // A read-only look inside for the playtest: the page's state, never anything recorded.
 declare global {
-  interface Window { __sayfold?: { state(): State; backend(): Backend | null; seconds(): number | null; modelReady(): boolean } }
+  interface Window { __sayfold?: { state(): State; backend(): Backend | null; seconds(): number | null; modelReady(): boolean; connected(): boolean } }
 }
 window.__sayfold = {
   state: () => state,
   backend: () => backend,
   seconds: () => last?.seconds ?? null,
   modelReady: () => speech.ready,
+  connected: () => link.current !== null,
 };

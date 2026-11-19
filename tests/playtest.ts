@@ -11,9 +11,10 @@
 // plays the same clip through an in-page stand-in for getUserMedia instead.
 //
 // Every request is watched (pages and the speech worker): nothing may go anywhere but Sayfold's own
-// origin and the lab hub's like API, which is mocked here (never the live one). On localhost the shared
-// analytics script is never fetched; a separate run under a made-up *.brightloopapps.com address checks
-// the usage events with the hub's built script and a stand-in PostHog.
+// origin, the lab hub's like API and GitHub's API, both mocked here (never the live ones, and never a
+// real token). The made-up token must only ever reach api.github.com. On localhost the shared analytics
+// script is never fetched; a separate run under a made-up *.brightloopapps.com address checks the usage
+// events with the hub's built script and a stand-in PostHog.
 //
 // Usage: node tests/playtest.ts <baseUrl>
 // Env:   PLAYTEST_BROWSER  Chromium-based browser executable (default: Brave)
@@ -43,6 +44,10 @@ const WAV_B64 = readFileSync(WAV).toString("base64");
 const EXPECTED_WORDS = ["tomatoes", "plumber", "friday"];
 const MAX_FILE = 25 * 1024 * 1024;
 const LAB = "https://lab.brightloopapps.com";
+const GITHUB = "https://api.github.com";
+/** A made-up token in the fine-grained shape: never a real one. */
+const TOKEN = "github_pat_11PLAYTEST0000000000_notarealtokenatallnotarealtokenatall0000000";
+const REPO = "lab-test/ideas";
 const own = new URL(base).origin;
 mkdirSync(out, { recursive: true });
 
@@ -107,7 +112,56 @@ const micMode = await (async () => {
 })();
 
 // --- pages ---------------------------------------------------------------------------------
-type Seen = { url: string; method: string; size?: number; status?: number };
+type Seen = { url: string; method: string; size?: number; status?: number; headers?: Record<string, string>; body?: string };
+
+/** What the stand-in GitHub answers for each step: "ok", an HTTP status, "rate" (403, none left) or "down" (no answer). */
+type GhAnswer = "ok" | number | "rate" | "down";
+/** A stateful stand-in for api.github.com: the repo, its labels, and creating issues. */
+async function mockGitHub(ctx, origin: string) {
+  const gh = { repo: "ok" as GhAnswer, labels: "ok" as GhAnswer, issue: "ok" as GhAnswer, delay: 0, calls: [] as string[], auth: new Set<string>(), issues: [] as any[] };
+  await ctx.route(`${GITHUB}/**`, async (route) => {
+    const req = route.request();
+    const url = new URL(req.url());
+    const cors = { "access-control-allow-origin": origin, vary: "Origin", "access-control-expose-headers": "retry-after, x-ratelimit-remaining, x-ratelimit-reset" };
+    if (req.method() === "OPTIONS") return route.fulfill({ status: 204, headers: { ...cors, "access-control-allow-methods": "GET, POST", "access-control-allow-headers": "authorization, content-type, accept" } });
+    gh.calls.push(`${req.method()} ${url.pathname}${url.search}`);
+    gh.auth.add(req.headers()["authorization"]);
+    const json = (status: number, body: unknown, headers = {}) => route.fulfill({ status, headers: { ...cors, ...headers }, contentType: "application/json", body: JSON.stringify(body) });
+    const answer = (mode: GhAnswer, ok: () => Promise<void>) => {
+      if (mode === "down") return route.abort("failed");
+      if (mode === "rate") return json(403, { message: "API rate limit exceeded" }, { "x-ratelimit-remaining": "0", "x-ratelimit-reset": String(Math.floor(Date.now() / 1000) + 300) });
+      if (typeof mode === "number") return json(mode, { message: "Stand-in error" });
+      return ok();
+    };
+    if (req.headers()["authorization"] !== `Bearer ${TOKEN}`) return json(401, { message: "Bad credentials" });
+    if (req.method() === "GET" && url.pathname === `/repos/${REPO}`) return answer(gh.repo, () => json(200, { full_name: REPO, has_issues: true, private: true }));
+    if (req.method() === "GET" && url.pathname === `/repos/${REPO}/labels`) {
+      return answer(gh.labels, () => json(200, [{ name: "bug", color: "d73a4a" }, { name: "idea", color: "a2eeef" }, { name: "later", color: "fbca04" }]));
+    }
+    if (req.method() === "POST" && url.pathname === `/repos/${REPO}/issues`) {
+      // A slow answer, for what the page does while an idea is on its way.
+      if (gh.delay) await new Promise((r) => setTimeout(r, gh.delay));
+      return answer(gh.issue, () => {
+        gh.issues.push(JSON.parse(req.postData() || "{}"));
+        const number = 41 + gh.issues.length;
+        return json(201, { number, html_url: `https://github.com/${REPO}/issues/${number}` });
+      });
+    }
+    fail(`GitHub stand-in: unexpected ${req.method()} ${url.pathname}`);
+    return json(404, { message: "Not Found" });
+  });
+  return gh;
+}
+
+/** The made-up token went only to api.github.com, in the Authorization header. */
+function tokenOnlyToGitHub(label: string, seen: Seen[]) {
+  for (const r of seen) {
+    const where = `${r.url} ${JSON.stringify(r.headers ?? {})} ${r.body ?? ""}`;
+    if (!where.includes(TOKEN)) continue;
+    if (new URL(r.url).origin !== GITHUB) fail(`${label}: the token went to ${r.url}`);
+    else if (r.url.includes(TOKEN) || (r.body ?? "").includes(TOKEN)) fail(`${label}: the token was in a GitHub address or body`);
+  }
+}
 
 /** A stateful stand-in for the hub's /api/likes: "ok" (12 likes) or "down". */
 async function mockLikes(ctx, mode: "ok" | "down" = "ok") {
@@ -134,9 +188,13 @@ async function mockLikes(ctx, mode: "ok" | "down" = "ok") {
   return api;
 }
 
-async function openPage(name: string, opts, { likes = "ok" as "ok" | "down", init = null as null | (() => void) } = {}) {
+async function openPage(name: string, opts, { likes = "ok" as "ok" | "down", init = null as null | (() => void), quiet = null as null | RegExp, refused = [] as string[] } = {}) {
   const ctx = await browser.newContext({ ...opts, permissions: ["clipboard-read", "clipboard-write", "microphone"] });
   await mockLikes(ctx, likes);
+  const gh = await mockGitHub(ctx, own);
+  ctx.on("requestfailed", (r) => {
+    if (refused.includes(r.url()) && !/BLOCKED_BY_CSP|csp/i.test(r.failure()?.errorText ?? "")) fail(`${name}: ${r.url()} failed, but not by the policy: ${r.failure()?.errorText}`);
+  });
   if (micMode === "in-page") await ctx.addInitScript(inPageMic, WAV_B64);
   if (init) await ctx.addInitScript(init);
   const seen: Seen[] = [];
@@ -144,9 +202,11 @@ async function openPage(name: string, opts, { likes = "ok" as "ok" | "down", ini
   ctx.on("request", (r) => {
     const u = r.url();
     if (u.startsWith("data:") || u.startsWith("blob:")) return;
-    seen.push({ url: u, method: r.method() });
-    if (new URL(u).origin === own || u.startsWith(`${LAB}/api/likes`)) return;
-    fail(`${name}: request to somewhere other than Sayfold and the like API: ${u}`);
+    seen.push({ url: u, method: r.method(), headers: r.headers(), body: r.postData() ?? undefined });
+    // A request the page's policy must refuse: it may only fail, blocked by the policy.
+    if (refused.includes(u)) return void r.response().then((res) => res && fail(`${name}: ${u} wasn't refused`));
+    if (new URL(u).origin === own || u.startsWith(`${LAB}/api/likes`) || new URL(u).origin === GITHUB) return;
+    fail(`${name}: request to somewhere other than Sayfold, the like API and GitHub's API: ${u}`);
   });
   ctx.on("response", async (r) => {
     const entry = seen.findLast((s) => s.url === r.url() && s.status === undefined);
@@ -159,11 +219,15 @@ async function openPage(name: string, opts, { likes = "ok" as "ok" | "down", ini
   page.on("console", (m) => {
     if (m.type() !== "error") return;
     if (likes === "down" && /Failed to load resource/.test(m.text())) return;
+    // GitHub's stand-in answers errors on purpose, and Chromium logs each one.
+    if (/Failed to load resource: the server responded with a status of (4\d\d|5\d\d)/.test(m.text()) && gh.calls.length) return;
+    if (/net::ERR_FAILED|net::ERR_INTERNET_DISCONNECTED/.test(m.text()) && gh.calls.length) return;
+    if (quiet?.test(m.text())) return;
     fail(`${name}: console error: ${m.text()}`);
   });
   page.on("pageerror", (e) => fail(`${name}: page error: ${e.message}`));
   await page.goto(base, { waitUntil: "load" });
-  return { ctx, page, seen };
+  return { ctx, page, seen, gh };
 }
 
 const state = (page) => page.evaluate(() => window.__sayfold.state());
@@ -210,6 +274,26 @@ async function record(page, label: string, seconds: number, startStop: () => Pro
   await waitState(page, ["review", "problem"], 180000);
   return Date.now() - t0;
 }
+
+/** In the page: every microphone stream it gets, the most tracks live at once, and each state it shows, in order. */
+function watchMic() {
+  const w = window as any;
+  w.__watch = { streams: [] as MediaStream[], maxLive: 0, states: [] as string[] };
+  const md = navigator.mediaDevices;
+  const ask = md.getUserMedia.bind(md);
+  md.getUserMedia = async (c) => {
+    const s = await ask(c);
+    w.__watch.streams.push(s);
+    const live = w.__watch.streams.flatMap((x: MediaStream) => x.getTracks()).filter((t: MediaStreamTrack) => t.readyState === "live").length;
+    w.__watch.maxLive = Math.max(w.__watch.maxLive, live);
+    return s;
+  };
+  new MutationObserver(() => {
+    const now = document.body?.dataset.state;
+    if (now && w.__watch.states.at(-1) !== now) w.__watch.states.push(now);
+  }).observe(document, { subtree: true, attributes: true, attributeFilter: ["data-state"] });
+}
+const liveTracks = (page) => page.evaluate(() => (window as any).__watch.streams.flatMap((s: MediaStream) => s.getTracks()).filter((t: MediaStreamTrack) => t.readyState === "live").length);
 
 const modelRequests = (seen: Seen[]) => seen.filter((s) => new URL(s.url).origin === own && /\/models\/|\.wasm$/.test(new URL(s.url).pathname));
 
@@ -303,8 +387,10 @@ await check("desktop", async () => {
   await page.locator("#text").pressSequentially(" Tomorrow.");
   assert.equal(await page.inputValue("#title"), "Post office");
 
-  // Keyboard: Tab from the text reaches Copy, then Record again. Enter on Copy copies title and text.
+  // Keyboard: Tab from the text reaches Send, then Copy, then Record again. Enter on Copy copies title and text.
   await page.locator("#text").focus();
+  await page.keyboard.press("Tab");
+  assert.equal(await page.evaluate(() => document.activeElement.id), "send");
   await page.keyboard.press("Tab");
   assert.equal(await page.evaluate(() => document.activeElement.id), "copy");
   await page.keyboard.press("Enter");
@@ -313,6 +399,21 @@ await check("desktop", async () => {
   assert.equal(await page.evaluate(() => navigator.clipboard.readText()), "Post office\n\nbuy stamps. Then post the letter. Tomorrow.");
   await page.keyboard.press("Tab");
   assert.equal(await page.evaluate(() => document.activeElement.id), "again");
+
+  // A title that is the whole text is copied once; with nothing to copy, Copy says so and copies nothing.
+  const copied = async () => {
+    await page.evaluate(() => document.querySelector("#toast").classList.remove("show"));
+    await page.locator("#copy").click();
+    await page.waitForFunction(() => document.querySelector("#toast").classList.contains("show"));
+    return [await page.textContent("#toast"), await page.evaluate(() => navigator.clipboard.readText())];
+  };
+  await page.fill("#text", "Buy oat milk.");
+  await page.fill("#title", "Buy oat milk");
+  assert.deepEqual(await copied(), ["Copied the text", "Buy oat milk."]);
+  await page.fill("#text", "");
+  await page.fill("#title", "");
+  assert.deepEqual(await copied(), ["There's nothing to copy yet", "Buy oat milk."]);
+  await page.locator("#again").focus();
 
   // Record again (with the keyboard): the model is ready, so nothing more is fetched.
   const before = modelRequests(seen).length;
@@ -389,12 +490,299 @@ await check("phone", async () => {
   assert.equal(await state(page), "review", await page.textContent("#problem-title"));
   const text = (await page.inputValue("#text")).toLowerCase();
   for (const w of EXPECTED_WORDS) assert.ok(text.includes(w), `"${w}" missing from "${text}"`);
-  for (const id of ["#copy", "#again"]) {
+  for (const id of ["#send", "#copy", "#again"]) {
     const b = await page.locator(id).boundingBox();
     assert.ok(b.height >= 44 && b.width >= 44, `${id} is ${b.width}x${b.height}`);
   }
   await noSideScroll(page, "phone review");
   await shots(page, "phone-review");
+  await ctx.close();
+});
+
+// --- the page's Content-Security-Policy -------------------------------------------------------------
+await check("content security policy", async () => {
+  const { ctx, page } = await openPage("content security policy", { viewport: { width: 1280, height: 900 } }, {
+    quiet: /Content Security Policy|example\.invalid/,
+    refused: ["https://example.invalid/x", "https://example.invalid/pixel.gif"],
+  });
+  const csp = await page.getAttribute('meta[http-equiv="Content-Security-Policy"]', "content");
+  assert.ok(csp, "no Content-Security-Policy in the built page");
+  assert.match(csp, /(^|; )connect-src 'self' https:\/\/api\.github\.com https:\/\/lab\.brightloopapps\.com https:\/\/eu\.i\.posthog\.com(;|$)/, csp);
+  // A request anywhere else is refused by the browser itself.
+  const refused = await page.evaluate(() => new Promise<string>((done) => {
+    addEventListener("securitypolicyviolation", (e) => done(`${e.violatedDirective} ${e.blockedURI}`), { once: true });
+    fetch("https://example.invalid/x", { method: "POST", body: "secret" }).catch(() => {});
+    setTimeout(() => done("not refused"), 3000);
+  }));
+  assert.match(refused, /^connect-src https:\/\/example\.invalid/);
+  const img = await page.evaluate(() => new Promise<string>((done) => {
+    addEventListener("securitypolicyviolation", (e) => done(e.violatedDirective), { once: true });
+    new Image().src = "https://example.invalid/pixel.gif";
+    setTimeout(() => done("not refused"), 3000);
+  }));
+  assert.equal(img, "img-src");
+  await ctx.close();
+});
+
+// --- send to GitHub, by keyboard (desktop, dark) -------------------------------------------------------
+// Connect with a github.com link and a made-up token, check the labels (`idea` chosen at first), send,
+// and land on a link to the new issue. The token stays in memory only, and Forget token clears it.
+const focused = (page) => page.evaluate(() => document.activeElement?.id || document.activeElement?.closest("label")?.textContent?.trim());
+const dialogOpen = (page) => page.evaluate(() => document.querySelector<HTMLDialogElement>("#gh").open);
+const chipState = (page) => page.$$eval("#chips input", (els: HTMLInputElement[]) => els.map((e) => `${e.value}${e.checked ? "*" : ""}`));
+
+await check("send", async () => {
+  const { ctx, page, seen, gh } = await openPage("send", { viewport: { width: 1280, height: 900 }, colorScheme: "dark" });
+  assert.equal(await page.textContent("#gh-open-label"), "Connect GitHub");
+  await record(page, "send", 5.5, () => page.keyboard.press("Space"));
+  assert.equal(await state(page), "review", await page.textContent("#problem-title"));
+  const said = await page.inputValue("#text");
+  assert.equal(await page.isVisible("#labels"), false, "labels show before connecting");
+  assert.match(await page.textContent("#send-to"), /Connect a repo of yours first/);
+
+  // Send, by keyboard, opens the setup.
+  await page.locator("#text").focus();
+  await page.keyboard.press("Tab");
+  assert.equal(await focused(page), "send");
+  await page.keyboard.press("Enter");
+  assert.equal(await dialogOpen(page), true, "Send didn't open the GitHub setup");
+  assert.equal(await focused(page), "gh-repo");
+  assert.equal(await page.getAttribute("#gh-howto a", "href"), "https://github.com/settings/personal-access-tokens/new");
+  assert.match(await page.textContent("#gh-howto"), /Issues.*Read and write/);
+  assert.match(await page.textContent("#gh-keep"), /memory only/);
+  assert.equal(await page.isChecked("#gh-remember"), false);
+
+  // Not a repo: said beside the field, and nothing is asked of GitHub.
+  await page.keyboard.type("just a name");
+  await page.keyboard.press("Enter");
+  assert.match(await page.textContent("#gh-repo-err"), /owner\/name/);
+  assert.equal(await focused(page), "gh-repo");
+  assert.equal(gh.calls.length, 0);
+  await page.fill("#gh-repo", `https://github.com/${REPO}/issues`);
+  await page.keyboard.press("Tab");
+  assert.equal(await focused(page), "gh-token");
+  await page.keyboard.type(TOKEN);
+  await shots(page, "desktop-connect");
+  await page.emulateMedia({ colorScheme: "dark" });
+  await page.keyboard.press("Enter");
+  await page.waitForFunction(() => !document.querySelector<HTMLDialogElement>("#gh").open, null, { timeout: 5000 });
+  assert.deepEqual(gh.calls, [`GET /repos/${REPO}`, `GET /repos/${REPO}/labels?per_page=100`]);
+  assert.deepEqual([...gh.auth], [`Bearer ${TOKEN}`]);
+  assert.equal(await focused(page), "send", "focus isn't back on Send");
+  assert.equal(await page.textContent("#gh-open-label"), REPO);
+  assert.match(await page.textContent("#send-to"), new RegExp(`As an issue in ${REPO}`));
+  assert.deepEqual(await chipState(page), ["bug", "idea*", "later"]);
+  const kept = await page.evaluate(() => ({ local: JSON.stringify(localStorage), session: JSON.stringify(sessionStorage), token: document.querySelector<HTMLInputElement>("#gh-token").value }));
+  assert.ok(!kept.local.includes("github_pat") && !kept.session.includes("github_pat"), "the token was stored without Remember");
+  assert.equal(kept.token, "", "the token stayed in the form");
+
+  // Pick `later` too, by keyboard: Shift+Tab from Send reaches the last chip.
+  await page.keyboard.press("Shift+Tab");
+  assert.equal(await page.evaluate(() => (document.activeElement as HTMLInputElement).value), "later");
+  await page.keyboard.press("Space");
+  assert.deepEqual(await chipState(page), ["bug", "idea*", "later*"]);
+  await page.keyboard.press("Tab");
+  await shots(page, "desktop-review-connected");
+  await page.emulateMedia({ colorScheme: "dark" });
+
+  // Send: the issue has the title, the transcript as its body, and the chosen labels.
+  await page.keyboard.press("Enter");
+  await waitState(page, ["sent"], 5000);
+  assert.deepEqual(gh.issues, [{ title: "New idea", body: said.trim(), labels: ["idea", "later"] }]);
+  assert.equal(await page.getAttribute("#sent-link", "href"), `https://github.com/${REPO}/issues/42`);
+  assert.equal(await page.textContent("#sent-link"), `issue #42 in ${REPO}`);
+  assert.equal(await focused(page), "next");
+  await noSideScroll(page, "desktop sent");
+  await shots(page, "desktop-sent");
+  await page.emulateMedia({ colorScheme: "dark" });
+
+  // Record the next idea, by keyboard; the labels chosen last time stay chosen.
+  await page.keyboard.press("Enter");
+  await waitState(page, ["recording"], 10000);
+  await page.waitForTimeout(5200);
+  await page.keyboard.press("Space");
+  await waitState(page, ["review", "problem"], 60000);
+  if (micMode === "in-page" || (await state(page)) === "review") {
+    assert.equal(await state(page), "review");
+    assert.deepEqual(await chipState(page), ["bug", "idea*", "later*"]);
+  }
+
+  // The header shows the repo; Forget token clears it from memory (and storage) in one click.
+  await page.locator("#gh-open").focus();
+  await page.keyboard.press("Enter");
+  assert.equal(await dialogOpen(page), true);
+  assert.match(await page.textContent("#gh-on"), new RegExp(REPO));
+  assert.match(await page.textContent("#gh-on-keep"), /memory only/);
+  await page.keyboard.press("Tab");
+  assert.equal(await focused(page), "gh-forget");
+  await page.keyboard.press("Enter");
+  assert.equal(await page.evaluate(() => window.__sayfold.connected()), false);
+  assert.match(await page.textContent("#gh-note"), /Token forgotten/);
+  assert.equal(await page.inputValue("#gh-token"), "");
+  await page.keyboard.press("Escape");
+  assert.equal(await dialogOpen(page), false);
+  assert.equal(await page.textContent("#gh-open-label"), "Connect GitHub");
+  assert.equal(await page.isVisible("#labels"), false);
+  tokenOnlyToGitHub("send", seen);
+  await ctx.close();
+});
+
+// --- send to GitHub on a phone: GitHub's errors, offline, and Remember on this device -------------------
+await check("send, phone", async () => {
+  const { ctx, page, seen, gh } = await openPage("send, phone", { viewport: { width: 390, height: 844 }, deviceScaleFactor: 2, isMobile: true, hasTouch: true, colorScheme: "light" });
+  // The footer: the like pill centred against the credit, and Source and Privacy on one line.
+  await page.waitForSelector("#like:not([hidden])", { timeout: 5000 });
+  const foot = await page.evaluate(() => {
+    const box = (el: Element) => el.getBoundingClientRect();
+    const [like, made, source, privacy] = [document.querySelector("#like"), document.querySelector(".made"), ...document.querySelectorAll(".more a")].map(box);
+    return { like: like.top + like.height / 2, made: made.top + made.height / 2, source: source.top, privacy: privacy.top };
+  });
+  assert.ok(Math.abs(foot.like - foot.made) <= 1.5, `the like pill isn't centred on the footer text (${foot.like} vs ${foot.made})`);
+  assert.ok(Math.abs(foot.source - foot.privacy) <= 1, "Privacy wrapped onto a line of its own");
+
+  await record(page, "send, phone", 5.5, () => page.locator("#rec").tap());
+  assert.equal(await state(page), "review", await page.textContent("#problem-title"));
+  const said = await page.inputValue("#text");
+  await page.locator("#send").tap();
+  assert.equal(await dialogOpen(page), true);
+  await page.fill("#gh-repo", REPO);
+  await page.fill("#gh-token", TOKEN);
+  await noSideScroll(page, "phone connect");
+  await shots(page, "phone-connect");
+  await page.emulateMedia({ colorScheme: "light" });
+
+  // Connecting: each of GitHub's refusals is said in plain words, and the form keeps what was typed.
+  const connectCases: [Partial<Record<"repo" | "labels", GhAnswer>>, RegExp][] = [
+    [{ repo: 404 }, /can't find lab-test\/ideas with this token/],
+    [{ repo: 401 }, /didn't accept this token/],
+    [{ repo: "ok", labels: 403 }, /can see lab-test\/ideas but not its issues/],
+    [{ repo: "rate", labels: "ok" }, /limit on requests was reached. Try again in about 5 minutes/],
+    [{ repo: "down" }, /Couldn't reach GitHub/],
+  ];
+  for (const [answers, message] of connectCases) {
+    Object.assign(gh, answers);
+    await page.locator("#gh-connect").tap();
+    await page.waitForFunction(() => document.querySelector("#gh-err").textContent !== "" && !document.querySelector<HTMLButtonElement>("#gh-connect").disabled, null, { timeout: 5000 });
+    assert.match(await page.textContent("#gh-err"), message);
+    assert.equal(await dialogOpen(page), true);
+    assert.equal(await page.inputValue("#gh-token"), TOKEN);
+  }
+  await shot(page, "phone-connect-error-light");
+  Object.assign(gh, { repo: "ok", labels: "ok" });
+  await page.locator("#gh-remember").tap();
+  assert.match(await page.textContent("#gh-keep"), /until you press Forget token/);
+  await page.locator("#gh-connect").tap();
+  await page.waitForFunction(() => !document.querySelector<HTMLDialogElement>("#gh").open, null, { timeout: 5000 });
+  const stored = await page.evaluate(() => localStorage.getItem("sayfold:github"));
+  assert.deepEqual(JSON.parse(stored), { repo: REPO, token: TOKEN });
+  for (const id of ["#send", "#copy", "#again"]) {
+    const b = await page.locator(id).boundingBox();
+    assert.ok(b.height >= 44, `${id} is ${b.height} high`);
+  }
+  await noSideScroll(page, "phone review connected");
+  await shots(page, "phone-review-connected");
+  await page.emulateMedia({ colorScheme: "light" });
+
+  // Sending: every refusal is said in plain words, and the text stays.
+  const sendCases: [GhAnswer, RegExp, boolean][] = [
+    [401, /didn't accept this token/, true],
+    [403, /can't create issues in lab-test\/ideas/, true],
+    [404, /can't find lab-test\/ideas/, true],
+    [410, /Issues are turned off in lab-test\/ideas/, false],
+    [422, /didn't accept this issue/, false],
+    ["rate", /limit on requests was reached/, false],
+    [502, /isn't answering properly/, false],
+    ["down", /Couldn't reach GitHub/, false],
+  ];
+  for (const [answer, message, reconnect] of sendCases) {
+    gh.issue = answer;
+    await page.locator("#send").tap();
+    await page.waitForFunction(() => !document.querySelector<HTMLElement>("#send-problem").hidden && !document.querySelector<HTMLButtonElement>("#send").disabled, null, { timeout: 5000 });
+    const text = await page.textContent("#send-problem-text");
+    assert.match(text, message, String(answer));
+    assert.match(text, /Your text is still here/);
+    assert.equal(await page.isVisible("#send-reconnect"), reconnect, `${answer}: Connect again`);
+    assert.equal(await focused(page), "send", `${answer}: focus isn't back on Send`);
+    assert.equal(await state(page), "review");
+    assert.equal(await page.inputValue("#text"), said, "the text changed");
+    if (answer === 403) await shot(page, "phone-send-error-light");
+  }
+  assert.equal(gh.issues.length, 0);
+
+  // Offline: Send waits, says so, and comes back by itself.
+  await ctx.setOffline(true);
+  await page.waitForFunction(() => document.querySelector<HTMLButtonElement>("#send").disabled);
+  assert.equal(await page.textContent("#send"), "Waiting for a connection…");
+  await shot(page, "phone-offline-light");
+  await ctx.setOffline(false);
+  await page.waitForFunction(() => !document.querySelector<HTMLButtonElement>("#send").disabled);
+  assert.equal(await page.textContent("#send"), "Send to GitHub");
+  assert.equal(await page.inputValue("#text"), said);
+
+  // Offline while an idea is on its way: "You're offline" goes by itself when the connection is back.
+  Object.assign(gh, { issue: "down", delay: 800 });
+  await page.locator("#send").tap();
+  await ctx.setOffline(true);
+  await page.waitForFunction(() => /offline/.test(document.querySelector("#send-problem-text").textContent), null, { timeout: 5000 });
+  assert.equal(await focused(page), "send-problem-text", "focus isn't on the problem while Send waits");
+  await ctx.setOffline(false);
+  await page.waitForFunction(() => document.querySelector<HTMLElement>("#send-problem").hidden, null, { timeout: 3000 }).catch(() => {
+    throw new Error("the offline message stayed after the connection came back");
+  });
+  gh.delay = 0;
+
+  gh.issue = "ok";
+  await page.locator("#send").tap();
+  await waitState(page, ["sent"], 5000);
+  assert.deepEqual(gh.issues, [{ title: "New idea", body: said.trim(), labels: ["idea"] }]);
+  await noSideScroll(page, "phone sent");
+  await shots(page, "phone-sent");
+
+  // Remembered: a later visit is still connected, until Forget token clears memory and storage at once.
+  await page.reload({ waitUntil: "load" });
+  assert.equal(await page.evaluate(() => window.__sayfold.connected()), true);
+  assert.equal(await page.textContent("#gh-open-label"), REPO);
+  await page.locator("#gh-open").tap();
+  assert.match(await page.textContent("#gh-on-keep"), /remembered on this device/);
+  await page.locator("#gh-forget").tap();
+  assert.equal(await page.evaluate(() => localStorage.getItem("sayfold:github")), null);
+  assert.equal(await page.evaluate(() => window.__sayfold.connected()), false);
+  tokenOnlyToGitHub("send, phone", seen);
+  await ctx.close();
+});
+
+// --- a slow send: nothing can start a recording until GitHub answers, and the microphone always ends ----------
+await check("send race", async () => {
+  const { ctx, page, gh } = await openPage("send race", { viewport: { width: 390, height: 844 }, colorScheme: "light" }, { init: watchMic });
+  await record(page, "send race", 3, () => page.locator("#rec").click());
+  assert.equal(await state(page), "review", await page.textContent("#problem-title"));
+  // owner/name with a trailing slash connects, as the same slash on a github.com link does.
+  await page.locator("#send").click();
+  await page.fill("#gh-repo", `${REPO}/`);
+  await page.fill("#gh-token", TOKEN);
+  await page.locator("#gh-connect").click();
+  await page.waitForFunction(() => !document.querySelector<HTMLDialogElement>("#gh").open, null, { timeout: 5000 }).catch(async () => {
+    throw new Error(`"${REPO}/" didn't connect: ${await page.textContent("#gh-repo-err")}`);
+  });
+  assert.equal(await page.textContent("#gh-open-label"), REPO);
+
+  gh.delay = 2500;
+  await page.locator("#send").click();
+  await page.waitForTimeout(300);
+  for (const id of ["#again", "#copy"]) assert.equal(await page.isDisabled(id), true, `${id} can be pressed while sending`);
+  await page.locator("#again").click({ force: true });
+  await page.locator("#copy").click({ force: true });
+  await waitState(page, ["sent"], 6000);
+  const states: string[] = await page.evaluate(() => (window as any).__watch.states);
+  assert.deepEqual(states.slice(states.lastIndexOf("review")), ["review", "sent"], `states after Send: ${states.join(" > ")}`);
+  assert.equal(gh.issues.length, 1);
+  assert.equal(await liveTracks(page), 0, "a microphone track is still live after sending");
+
+  // The next idea records with one microphone, and lets it go at Stop.
+  gh.delay = 0;
+  await record(page, "send race, next", 2, () => page.locator(":is(#next, #rec):visible").click());
+  assert.equal(await liveTracks(page), 0, "a microphone track is still live after the next idea");
+  assert.equal(await page.evaluate(() => (window as any).__watch.maxLive), 1, "two microphone tracks were live at once");
   await ctx.close();
 });
 
@@ -436,8 +824,9 @@ await check("likes down", async () => {
 // Sayfold under a made-up sayfold.playtest.brightloopapps.com, which the browser resolves to the local server
 // (so the speech worker and the audio worklet reach it too) and treats as secure, with the hub's
 // built script served from LAB_ANALYTICS_JS (never the live one) and PostHog answered here. A recording
-// sends exactly $pageview, play_started and play_finished (with only its length bucket and backend), and
-// no request holds anything that was said. With Do Not Track on, the script isn't even fetched.
+// sent to (a stand-in) GitHub sends exactly $pageview, play_started, play_finished (with only its length
+// bucket and backend) and idea_sent (with nothing at all), and no analytics request holds anything that
+// was said, the repo, the token or a label. With Do Not Track on, the script isn't even fetched.
 const ANALYTICS_JS = process.env.LAB_ANALYTICS_JS || join(homedir(), "brightloop-lab/lab/hub/public/analytics/v1.js");
 
 function decodeEvents(body: Buffer | null) {
@@ -500,6 +889,7 @@ async function analytics(dnt: boolean) {
     }
     await route.fulfill({ status: 200, contentType: "application/json", body: '{"status":"Ok"}' });
   });
+  const gh = await mockGitHub(ctx, site);
   ctx.on("request", (q) => {
     const u = new URL(q.url());
     if (u.protocol.startsWith("http")) r.hosts.add(u.hostname);
@@ -512,6 +902,16 @@ async function analytics(dnt: boolean) {
     await record(page, label, 5.5, () => page.locator("#rec").click());
     assert.equal(await state(page), "review", await page.textContent("#problem-title"));
     const backend = await page.evaluate(() => window.__sayfold.backend());
+    // Connect and send it to GitHub's stand-in, with the `later` label too.
+    await page.locator("#send").click();
+    await page.fill("#gh-repo", REPO);
+    await page.fill("#gh-token", TOKEN);
+    await page.locator("#gh-connect").click();
+    await page.waitForFunction(() => !document.querySelector<HTMLDialogElement>("#gh").open, null, { timeout: 5000 });
+    await page.locator("#chips label", { hasText: "later" }).click();
+    await page.locator("#send").click();
+    await waitState(page, ["sent"], 5000);
+    assert.equal(gh.issues.length, 1);
     await page.waitForTimeout(dnt ? 1500 : 4000);
     if (dnt) {
       assert.equal(r.scripts, 0, "the analytics script was fetched with Do Not Track on");
@@ -521,7 +921,7 @@ async function analytics(dnt: boolean) {
     assert.equal(r.scripts, 1, `the analytics script was fetched ${r.scripts} times`);
     const ours = (e) => Object.fromEntries(Object.entries(e.properties ?? {}).filter(([k]) => !k.startsWith("$") && !["token", "distinct_id", "project"].includes(k)));
     const seen = r.events.map((e) => `${e.event} ${JSON.stringify(ours(e))}`).sort();
-    const wanted = ["$pageview {}", `play_finished ${JSON.stringify({ seconds_bucket: "0-9", backend })}`, "play_started {}"];
+    const wanted = ["$pageview {}", "idea_sent {}", `play_finished ${JSON.stringify({ seconds_bucket: "0-9", backend })}`, "play_started {}"];
     assert.deepEqual(seen, wanted);
     for (const e of r.events) {
       const p = e.properties ?? {};
@@ -530,13 +930,15 @@ async function analytics(dnt: boolean) {
     }
     const said = ["tomato", "plumber", "friday", "new idea", "water"];
     for (const body of r.bodies) for (const w of said) assert.ok(!body.toLowerCase().includes(w), `analytics sent "${w}"`);
+    const github = ["github_pat", TOKEN, "lab-test", "later", "a2eeef", "fbca04", "api.github.com"];
+    for (const body of r.bodies) for (const w of github) assert.ok(!body.includes(w), `analytics sent "${w}"`);
     const kept = await page.evaluate(() => ({ local: Object.keys(localStorage), session: Object.keys(sessionStorage) }));
     assert.deepEqual(kept.local.filter((k) => k !== "sayfold:like"), [], "analytics left localStorage");
     assert.deepEqual(kept.session, [], "analytics left sessionStorage");
     assert.deepEqual((await ctx.cookies()).map((c) => c.name), [], "cookies were set");
-    console.log(`analytics: ${seen.join(", ")}; nothing said was sent, no cookies or storage`);
+    console.log(`analytics: ${seen.join(", ")}; nothing said, no repo, token or label was sent, no cookies or storage`);
   });
-  const allowed = new Set([host, new URL(LAB).hostname, ...(dnt ? [] : ["eu.i.posthog.com"])]);
+  const allowed = new Set([host, new URL(LAB).hostname, new URL(GITHUB).hostname, ...(dnt ? [] : ["eu.i.posthog.com"])]);
   for (const x of r.hosts) if (!allowed.has(x)) fail(`${label}: the page contacted ${x}`);
   await hostBrowser.close();
 }

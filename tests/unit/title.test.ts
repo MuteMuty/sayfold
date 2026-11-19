@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { titleFrom, TITLE_MAX, clipboardText } from "../../src/core/title.ts";
+import { titleFrom, TITLE_MAX, clipboardText, copyNote } from "../../src/core/title.ts";
 
 test("the title is the first line", () => {
   assert.equal(titleFrom("Buy oat milk\nand bread too"), "Buy oat milk");
@@ -67,4 +67,24 @@ test("a clause break too early to make a title is passed over", () => {
 
 test("a short first sentence keeps its commas", () => {
   assert.equal(titleFrom("Milk, eggs and bread. Then the bank."), "Milk, eggs and bread");
+});
+
+test("copy with nothing in either field says there's nothing to copy", () => {
+  assert.deepEqual(copyNote("", ""), { text: "", message: "There's nothing to copy yet" });
+  assert.deepEqual(copyNote("  ", " \n "), { text: "", message: "There's nothing to copy yet" });
+});
+
+test("copy says what it copied", () => {
+  assert.deepEqual(copyNote("Groceries", "Milk"), { text: "Groceries\n\nMilk", message: "Copied the title and text" });
+  assert.deepEqual(copyNote("", "Milk"), { text: "Milk", message: "Copied the text" });
+  assert.deepEqual(copyNote("Groceries", ""), { text: "Groceries", message: "Copied the title" });
+});
+
+test("when the title is the whole transcript, copy gives it once", () => {
+  assert.deepEqual(copyNote("Buy oat milk", "Buy oat milk"), { text: "Buy oat milk", message: "Copied the text" });
+  // As the title is made from it: capitalised, without the full stop.
+  assert.deepEqual(copyNote(titleFrom("buy oat milk."), "buy oat milk."), { text: "buy oat milk.", message: "Copied the text" });
+  assert.equal(clipboardText("Call  the plumber!", "call the plumber! "), "call the plumber!");
+  // A title that's only the first sentence is still copied with the rest.
+  assert.equal(clipboardText("Buy oat milk", "Buy oat milk. And bread."), "Buy oat milk\n\nBuy oat milk. And bread.");
 });

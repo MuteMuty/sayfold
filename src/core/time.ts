@@ -12,4 +12,7 @@ export function clock(seconds: number): string {
 /** The recording has reached the cap. */
 export const capReached = (samples: number, rate: number) => samples >= MAX_SECONDS * rate;
 
+/** The frames a recording keeps: all of them, or exactly two minutes' worth once the cap is reached. */
+export const cappedFrames = (frames: number, rate: number) => Math.min(frames, Math.ceil(MAX_SECONDS * rate));
+
 export const secondsLeft = (elapsed: number) => Math.max(0, MAX_SECONDS - elapsed);
