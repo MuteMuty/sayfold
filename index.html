@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Sayfold: say an idea, get it as text</title>
+    <meta name="description" content="Press record, say an idea, and review it as text. Speech is turned into text in your browser, so your voice never leaves your device." />
+    <meta name="theme-color" content="#0f1714" media="(prefers-color-scheme: dark)" />
+    <meta name="theme-color" content="#eef1ec" media="(prefers-color-scheme: light)" />
+    <meta property="og:title" content="Sayfold" />
+    <meta property="og:description" content="Say an idea, get it as text. Speech to text runs in your browser." />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+  </head>
+  <body data-state="idle">
+    <header class="top">
+      <h1 class="brand">
+        <svg class="mark" viewBox="0 0 32 32" aria-hidden="true">
+          <path d="M6 5h14l6 6v16H6z" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linejoin="round" />
+          <path d="M20 5v6h6" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linejoin="round" />
+          <path d="M11 15v6M15 13v10M19 16v4" stroke="var(--accent)" stroke-width="2.4" stroke-linecap="round" />
+        </svg>
+        Sayfold
+      </h1>
+      <p class="tagline">Say an idea, get it as text</p>
+    </header>
+
+    <main class="stage">
+      <!-- Record, then the work in progress, or what went wrong. Which one shows is body[data-state]. -->
+      <section id="capture" class="capture" aria-label="Record">
+        <canvas id="wave" class="wave" aria-hidden="true"></canvas>
+        <p id="clock" class="clock"><span id="clock-now">0:00</span><span class="clock-cap"> / 2:00</span></p>
+
+        <button id="rec" class="rec" type="button" aria-describedby="rec-help">
+          <span class="rec-glyph" aria-hidden="true"></span>
+          <span id="rec-label" class="rec-label">Record</span>
+        </button>
+        <p id="rec-help" class="help">
+          <span class="help-idle">Up to 2 minutes. </span><span class="help-recording">Stops on its own at 2:00. </span><span class="keys">Or press <kbd>Space</kbd> to start and stop.</span>
+        </p>
+
+        <div id="work" class="work">
+          <p id="work-label" class="work-label">Getting the speech model ready</p>
+          <div class="bar" aria-hidden="true"><span id="bar-fill" class="bar-fill"></span></div>
+          <p id="work-note" class="work-note"></p>
+        </div>
+
+        <div id="problem" class="problem" role="alert">
+          <h2 id="problem-title" class="problem-title"></h2>
+          <p id="problem-body" class="problem-body"></p>
+          <button id="retry" class="primary" type="button">Try again</button>
+        </div>
+      </section>
+
+      <!-- The transcript, ready to edit. Nothing here is stored or sent: it lives in this tab until you leave. -->
+      <section id="review" class="review" aria-labelledby="review-h">
+        <h2 id="review-h" class="sr-only">Your idea</h2>
+        <div class="note">
+          <label class="field-label" for="title">Title</label>
+          <input id="title" class="title" type="text" autocomplete="off" spellcheck="true" maxlength="200" />
+          <label class="field-label" for="text">Text</label>
+          <textarea id="text" class="text" rows="7" spellcheck="true"></textarea>
+        </div>
+        <div class="actions">
+          <button id="copy" class="primary" type="button">Copy</button>
+          <button id="again" type="button">Record again</button>
+        </div>
+      </section>
+
+      <p class="promise">Speech is turned into text on this device. Your voice and your words are never uploaded.</p>
+    </main>
+
+    <!-- Says each change of state to screen readers: recording, transcribing, ready. -->
+    <p id="say" class="sr-only" aria-live="polite"></p>
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+    <footer class="foot">
+      <p>
+        <!-- The like heart. Hidden until the counts load from the lab hub (see core/likes.ts). -->
+        <button id="like" class="like" type="button" aria-pressed="false" hidden>
+          <svg class="heart" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 13.7 2.7 8.5a3.2 3.2 0 0 1 4.6-4.5l.7.7.7-.7a3.2 3.2 0 0 1 4.6 4.5z" /></svg>
+          <span id="like-n" class="like-n">0</span>
+        </button>
+        Made by <a href="https://github.com/MuteMuty">Erik Pahor</a> at <a href="https://lab.brightloopapps.com">BrightLoop Lab</a>. <a href="https://github.com/MuteMuty/sayfold">Source</a> <a href="https://lab.brightloopapps.com/privacy">Privacy</a>
+      </p>
+    </footer>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
