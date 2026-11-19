@@ -41,7 +41,7 @@
           <span id="rec-label" class="rec-label">Record</span>
         </button>
         <p id="rec-help" class="help">
-          <span class="help-idle">Up to 2 minutes. </span><span class="help-recording">Stops on its own at 2:00. </span><span class="keys">Or press <kbd>Space</kbd> to start and stop.</span>
+          <span class="help-idle">Up to 2 minutes. Sayfold understands English. </span><span class="help-recording">Stops on its own at 2:00. </span><span class="keys">Or press <kbd>Space</kbd> to start and stop.</span>
         </p>
 
         <div id="work" class="work">
@@ -67,6 +67,8 @@
           <label class="field-label" for="text">Text</label>
           <textarea id="text" class="text" rows="7" spellcheck="true"></textarea>
         </div>
+        <!-- Shown when a part of the recording that had speech in it came back empty or far too short. -->
+        <p id="missing" class="missing" hidden>Part of the recording may be missing. Check the text before sending.</p>
         <!-- The repo's labels, as chips. `idea` is chosen at first when the repo has it. -->
         <fieldset id="labels" class="labels" hidden>
           <legend class="field-label">Labels</legend>

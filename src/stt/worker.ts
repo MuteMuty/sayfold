@@ -8,6 +8,7 @@ import type { FromWorker, ToWorker } from "./messages.ts";
 import type { Backend } from "../analytics-events.ts";
 import { resample, TARGET_RATE } from "../core/resample.ts";
 import { segments, silent } from "../core/segments.ts";
+import { clip, transcript } from "../core/transcript.ts";
 
 type Transcriber = (audio: Float32Array, options: { max_new_tokens: number }) => Promise<{ text: string } | { text: string }[]>;
 
@@ -66,18 +67,19 @@ function ensureLoaded() {
 async function transcribe(id: number, raw: Float32Array, rate: number) {
   const { asr, backend } = await ensureLoaded();
   const samples = resample(raw, rate, TARGET_RATE);
-  if (silent(samples)) return post({ type: "result", id, text: "", backend });
+  if (silent(samples)) return post({ type: "result", id, text: "", backend, gaps: false });
   const parts = segments(samples, TARGET_RATE);
-  const texts: string[] = [];
-  for (const [i, [a, b]] of parts.entries()) {
-    post({ type: "part", id, done: i, of: parts.length });
-    const clip = samples.subarray(a, b);
-    // About six tokens a second of speech, with room for a short clip.
-    const out = await asr(clip, { max_new_tokens: Math.max(12, Math.ceil(((b - a) / TARGET_RATE) * 6.5)) });
-    const text = (Array.isArray(out) ? out[0]?.text : out.text) ?? "";
-    if (text.trim()) texts.push(text.trim());
-  }
-  post({ type: "result", id, text: texts.join(" "), backend });
+  const { text, gaps } = await transcript(
+    parts,
+    async (ps) => {
+      const audio = clip(samples, ps);
+      // About six tokens a second of speech, with room for a short clip.
+      const out = await asr(audio, { max_new_tokens: Math.max(12, Math.ceil((audio.length / TARGET_RATE) * 6.5)) });
+      return (Array.isArray(out) ? out[0]?.text : out.text) ?? "";
+    },
+    (done) => post({ type: "part", id, done, of: parts.length }),
+  );
+  post({ type: "result", id, text, backend, gaps });
 }
 
 self.onmessage = (e: MessageEvent<ToWorker>) => {

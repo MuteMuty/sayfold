@@ -193,7 +193,7 @@ async function transcribe() {
       return;
     }
     plays.finished(rec.seconds, result.backend);
-    showReview(result.text.trim());
+    showReview(result.text.trim(), result.gaps);
   } catch (e) {
     console.warn("Sayfold: transcription failed:", e);
     // The recording stays, so Try again doesn't need a new one.
@@ -205,12 +205,18 @@ async function transcribe() {
 /** The title follows the first line until you write your own. */
 let titleFollows = true;
 
-function showReview(text: string) {
+const missingNote = $("#missing");
+
+function showReview(text: string, gaps = false) {
   textIn.value = text;
   titleIn.value = titleFrom(text);
   titleFollows = true;
+  missingNote.hidden = !gaps;
+  // A hidden note would still be read as the description, so it's only linked while it shows.
+  if (gaps) textIn.setAttribute("aria-describedby", "missing");
+  else textIn.removeAttribute("aria-describedby");
   setState("review");
-  say("Your idea is ready to review");
+  say(gaps ? `Your idea is ready to review. ${missingNote.textContent}` : "Your idea is ready to review");
   textIn.focus();
   textIn.setSelectionRange(text.length, text.length);
   renderSend();
