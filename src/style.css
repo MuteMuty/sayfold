@@ -404,6 +404,8 @@ a:focus-visible { outline: 2.5px solid var(--focus); outline-offset: 3px; }
 
 /* ---- sending ---- */
 .send-to { margin: -0.35rem 0 0; color: var(--ink-dim); font-size: 0.88rem; }
+/* Part of the recording may be missing: said calmly, above the actions. */
+.missing,
 .send-problem {
   display: flex;
   flex-direction: column;
@@ -414,7 +416,8 @@ a:focus-visible { outline: 2.5px solid var(--focus); outline-offset: 3px; }
   border-radius: 12px;
   background: var(--accent-soft);
 }
-.send-problem-text { margin: 0; }
+.send-problem-text,
+.missing { margin: 0; }
 
 /* ---- sent: the folded note again, with a tick ---- */
 .sent {

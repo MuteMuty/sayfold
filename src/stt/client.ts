@@ -9,10 +9,17 @@ export interface SpeechEvents {
   part(done: number, of: number): void;
 }
 
+/** The text, who made it, and whether part of the recording may be missing from it. */
+export interface Transcript {
+  text: string;
+  backend: Backend;
+  gaps: boolean;
+}
+
 export class Speech {
   private worker: Worker | null = null;
   private next = 0;
-  private pending = new Map<number, { resolve(r: { text: string; backend: Backend }): void; reject(e: Error): void }>();
+  private pending = new Map<number, { resolve(r: Transcript): void; reject(e: Error): void }>();
   ready = false;
 
   private readonly on: SpeechEvents;
@@ -27,7 +34,7 @@ export class Speech {
   }
 
   /** Mono samples at `rate`; the worker resamples, cuts long recordings in pauses and transcribes each part. */
-  transcribe(samples: Float32Array, rate: number): Promise<{ text: string; backend: Backend }> {
+  transcribe(samples: Float32Array, rate: number): Promise<Transcript> {
     const id = ++this.next;
     return new Promise((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
@@ -58,7 +65,7 @@ export class Speech {
       this.on.ready(m.backend);
     } else if (m.type === "part") this.on.part(m.done, m.of);
     else if (m.type === "result") {
-      this.pending.get(m.id)?.resolve({ text: m.text, backend: m.backend });
+      this.pending.get(m.id)?.resolve({ text: m.text, backend: m.backend, gaps: m.gaps });
       this.pending.delete(m.id);
     } else if (m.type === "error") {
       // A failed background load is reported when a transcription asks for the model.

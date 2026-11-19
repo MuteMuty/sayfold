@@ -5,6 +5,23 @@
 // The microphone is fake and plays tests/fixtures/idea.wav, an original clip made with macOS `say`:
 //   say -v Samantha -r 170 -o idea.aiff "New idea. Water the tomatoes every morning, and call the plumber on Friday."
 //   afconvert -f WAVE -d LEI16@48000 -c 1 idea.aiff tests/fixtures/idea.wav
+// A long recording (lab#95) plays tests/fixtures/long-idea.wav: 48 s of fifteen different sentences with
+// thinking pauses between some of them, also made with `say` (the [[slnc]] marks are silences, in ms):
+//   say -v Karen -r 230 -o long-idea.aiff "$(cat <<'EOF'
+//   Long idea for the garden project. [[slnc 1500]] First, order three bags of compost from the farm shop.
+//   The blue wheelbarrow has a flat wheel again. [[slnc 2500]] Ask Martin whether he can lend us his ladder on
+//   Saturday. We should paint the fence green instead of brown. [[slnc 1200]] Plant the carrots near the
+//   kitchen window, where the soil is soft. [[slnc 2000]] Buy a watering can with a long spout. Check the price
+//   of solar lights at the hardware store. [[slnc 2500]] The pond needs cleaning before the frogs come back.
+//   Move the herb pots to the sunny corner by the steps. [[slnc 1800]] Fix the gate latch so the dog cannot
+//   get out. [[slnc 1000]] Put a bench under the apple tree for reading in the evening. [[slnc 2000]] Collect
+//   rainwater in the old barrel behind the shed. Remember to cover the strawberries with a net against the
+//   birds. [[slnc 1500]] Finally, send the photos to grandmother on Sunday.
+//   EOF
+//   )"
+//   afconvert -f WAVE -d LEI16@16000 -c 1 long-idea.aiff tests/fixtures/long-idea.wav
+// It always plays through the in-page stand-in, with a room's steady noise mixed in (LONG_SNR), as a phone
+// on a table hears it: the pauses then aren't digital silence, which is what made the speech model stop early.
 // First choice is Chromium's own fake capture device (--use-fake-device-for-media-stream with
 // --use-file-for-fake-audio-capture). On macOS, a browser started by an app without microphone
 // permission never answers getUserMedia, even for the fake device; the playtest then says so and
@@ -42,6 +59,21 @@ const browserPath = process.env.PLAYTEST_BROWSER || "/Applications/Brave Browser
 const WAV = join(repo, "tests/fixtures/idea.wav");
 const WAV_B64 = readFileSync(WAV).toString("base64");
 const EXPECTED_WORDS = ["tomatoes", "plumber", "friday"];
+const LONG = readFileSync(join(repo, "tests/fixtures/long-idea.wav"));
+const LONG_B64 = LONG.toString("base64");
+/** Its length: the data chunk's bytes, at 16 kHz in 16 bits. */
+const LONG_SECONDS = LONG.readUInt32LE(LONG.indexOf("data") + 4) / 32000;
+/** Speech to room noise, in dB, for the long recording. */
+const LONG_SNR = 10;
+/** Each sentence of the long recording, by three of its words: it's there when at least two are, so a misheard
+ *  word ("solar mites") passes and a dropped sentence doesn't. No word belongs to two sentences. */
+const LONG_SENTENCES = [
+  ["long idea", "garden", "project"], ["bags", "compost", "farm shop"], ["blue", "flat", "wheel"], ["martin", "lend us", "saturday"],
+  ["fence", "green", "instead"], ["carrots", "kitchen", "soil"], ["buy a", "watering", "long s"], ["price", "solar", "hardware"],
+  ["needs cleaning", "frogs", "come back"], ["pots", "sunny", "corner"], ["latch", "dog", "get out"], ["apple tree", "reading", "evening"],
+  ["rainwater", "barrel", "behind"], ["strawberries", "cover", "against"], ["photos", "grandmother", "sunday"],
+];
+const MISSING_NOTE = "Part of the recording may be missing. Check the text before sending.";
 const MAX_FILE = 25 * 1024 * 1024;
 const LAB = "https://lab.brightloopapps.com";
 const GITHUB = "https://api.github.com";
@@ -75,12 +107,29 @@ const launch = (fakeDevice: boolean, extra: string[] = []) => {
 let browser = await launch(true);
 
 // --- the microphone ------------------------------------------------------------------------
-/** Plays the clip into a MediaStream, standing in for getUserMedia (only used when the real fake device can't answer). */
-function inPageMic(b64: string) {
+/** Plays a clip into a MediaStream, standing in for getUserMedia (used when the real fake device can't answer, and
+ *  for the long recording). With `snr`, a room's steady noise (seeded, so every run hears the same) is mixed in. */
+function inPageMic({ b64, snr }: { b64: string; snr?: number }) {
   navigator.mediaDevices.getUserMedia = async () => {
     const ctx = new AudioContext({ sampleRate: 48000 });
     const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
     const buf = await ctx.decodeAudioData(bytes.buffer);
+    if (snr !== undefined) {
+      const x = buf.getChannelData(0);
+      const noise = new Float32Array(x.length);
+      let seed = 11, b0 = 0, b1 = 0, b2 = 0, speech = 0, room = 0;
+      for (let i = 0; i < x.length; i++) {
+        seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+        const w = seed / 0x7fffffff - 0.5;
+        // Roughly pink: more rumble than hiss, as rooms are.
+        b0 = 0.99765 * b0 + w * 0.099; b1 = 0.963 * b1 + w * 0.2965; b2 = 0.57 * b2 + w * 1.0527;
+        noise[i] = b0 + b1 + b2 + w * 0.1848;
+        speech += x[i] * x[i];
+        room += noise[i] * noise[i];
+      }
+      const k = Math.sqrt(speech / room / 10 ** (snr / 10));
+      for (let i = 0; i < x.length; i++) x[i] += noise[i] * k;
+    }
     const src = ctx.createBufferSource();
     src.buffer = buf;
     const dest = ctx.createMediaStreamDestination();
@@ -188,14 +237,14 @@ async function mockLikes(ctx, mode: "ok" | "down" = "ok") {
   return api;
 }
 
-async function openPage(name: string, opts, { likes = "ok" as "ok" | "down", init = null as null | (() => void), quiet = null as null | RegExp, refused = [] as string[] } = {}) {
+async function openPage(name: string, opts, { likes = "ok" as "ok" | "down", init = null as null | (() => void), quiet = null as null | RegExp, refused = [] as string[], mic = null as null | { b64: string; snr?: number } } = {}) {
   const ctx = await browser.newContext({ ...opts, permissions: ["clipboard-read", "clipboard-write", "microphone"] });
   await mockLikes(ctx, likes);
   const gh = await mockGitHub(ctx, own);
   ctx.on("requestfailed", (r) => {
     if (refused.includes(r.url()) && !/BLOCKED_BY_CSP|csp/i.test(r.failure()?.errorText ?? "")) fail(`${name}: ${r.url()} failed, but not by the policy: ${r.failure()?.errorText}`);
   });
-  if (micMode === "in-page") await ctx.addInitScript(inPageMic, WAV_B64);
+  if (mic || micMode === "in-page") await ctx.addInitScript(inPageMic, mic ?? { b64: WAV_B64 });
   if (init) await ctx.addInitScript(init);
   const seen: Seen[] = [];
   // Context-wide, so the speech worker's requests are watched too.
@@ -330,6 +379,7 @@ await check("desktop", async () => {
   // The shortcut is offered on a desktop.
   assert.equal(await page.isVisible(".keys"), true, "the Space hint isn't shown on desktop");
   assert.match(await page.textContent("#rec-help"), /Up to 2 minutes/);
+  assert.equal(await page.isVisible("text=Sayfold understands English."), true, "the English-only line isn't shown");
   await shots(page, "desktop-idle");
   await page.emulateMedia({ colorScheme: "dark" });
 
@@ -360,6 +410,8 @@ await check("desktop", async () => {
   const text = await page.inputValue("#text");
   for (const w of EXPECTED_WORDS) assert.ok(text.toLowerCase().includes(w), `"${w}" missing from "${text}"`);
   assert.equal(await page.inputValue("#title"), "New idea");
+  assert.equal(await page.isVisible("#missing"), false, "says part may be missing from a short clip that came through");
+  assert.equal(await page.getAttribute("#text", "aria-describedby"), null);
   assert.equal(await page.evaluate(() => document.activeElement.id), "text");
   const backend = await page.evaluate(() => window.__sayfold.backend());
   assert.ok(backend === "webgpu" || backend === "wasm", backend);
@@ -470,10 +522,61 @@ await check("desktop, CPU", async () => {
   await ctx.close();
 });
 
+// --- a long recording: every sentence, on WebGPU and on the CPU (lab#95) ---------------------------------
+// 48 s of different sentences with thinking pauses, in a room's noise. Before lab#95, parts of up to 20 s
+// lost their last sentences without a word on screen.
+for (const cpu of [false, true]) {
+  const label = `long recording${cpu ? ", CPU" : ""}`;
+  await check(label, async () => {
+    const { ctx, page } = await openPage(label, { viewport: { width: 1280, height: 900 }, colorScheme: "dark" }, { mic: { b64: LONG_B64, snr: LONG_SNR } });
+    if (cpu) {
+      await ctx.route(/\/assets\/worker-[^/]+\.js$/, async (route) => {
+        const res = await route.fetch();
+        await route.fulfill({ response: res, body: `delete WebAssembly.Suspending;\n${await res.text()}` });
+      });
+    }
+    const ms = await record(page, label, LONG_SECONDS + 1, () => page.locator("#rec").click());
+    assert.equal(await state(page), "review", await page.textContent("#problem-title"));
+    const backend = await page.evaluate(() => window.__sayfold.backend());
+    if (cpu) assert.equal(backend, "wasm");
+    const said = await page.inputValue("#text");
+    const text = said.toLowerCase();
+    const lost = LONG_SENTENCES.map((ws, i) => [i + 1, ws.filter((w) => new RegExp(`\\b${w}`).test(text)).length] as const).filter(([, n]) => n < 2).map(([i]) => i);
+    assert.deepEqual(lost, [], `sentence ${lost.join(", ")} of ${LONG_SENTENCES.length} missing from "${said}"`);
+    assert.equal(await page.isVisible("#missing"), false, "says part may be missing, though every sentence is there");
+    console.log(`${label}: all ${LONG_SENTENCES.length} sentences (${backend}, ${ms} ms from Stop for ${LONG_SECONDS.toFixed(1)} s)`);
+    await ctx.close();
+  });
+}
+
+// --- part of a recording came back short: the review says so, and keeps the text -------------------------
+// The worker is served so that it reports a gap with its result, as it does when a part with speech in it
+// came back empty or far too short (which the unit tests cover).
+await check("gap note", async () => {
+  for (const [size, viewport, mobile] of [["desktop", { width: 1280, height: 900 }, false], ["phone", { width: 390, height: 844 }, true]] as const) {
+    const { ctx, page } = await openPage(`gap note, ${size}`, { viewport, isMobile: mobile, hasTouch: mobile, colorScheme: "light" });
+    await ctx.route(/\/assets\/worker-[^/]+\.js$/, async (route) => {
+      const res = await route.fetch();
+      const patch = "const __post = self.postMessage.bind(self); self.postMessage = (m, t) => __post(m && m.type === 'result' ? { ...m, gaps: true } : m, t);";
+      await route.fulfill({ response: res, body: `${patch}\n${await res.text()}` });
+    });
+    await record(page, `gap note, ${size}`, 5.5, () => page.locator("#rec").click());
+    assert.equal(await state(page), "review", await page.textContent("#problem-title"));
+    assert.equal(await page.isVisible("#missing"), true, "no note that part may be missing");
+    assert.equal((await page.textContent("#missing")).trim(), MISSING_NOTE);
+    assert.equal(await page.getAttribute("#text", "aria-describedby"), "missing");
+    assert.match((await page.inputValue("#text")).toLowerCase(), /tomatoes/, "the text wasn't kept");
+    await noSideScroll(page, `gap note, ${size}`);
+    await shots(page, `${size}-review-gap`);
+    await ctx.close();
+  }
+});
+
 // --- phone, light: the whole flow by touch -------------------------------------------------------
 await check("phone", async () => {
   const { ctx, page } = await openPage("phone", { viewport: { width: 390, height: 844 }, deviceScaleFactor: 2, isMobile: true, hasTouch: true, colorScheme: "light" });
   assert.equal(await page.isVisible(".keys"), false, "the Space hint shows on a phone");
+  assert.equal(await page.isVisible("text=Sayfold understands English."), true, "the English-only line isn't shown on a phone");
   const box = await page.locator("#rec").boundingBox();
   assert.ok(box.width >= 120 && box.height >= 120, `record button ${box.width}x${box.height}`);
   await noSideScroll(page, "phone idle");
@@ -861,7 +964,7 @@ async function analytics(dnt: boolean) {
     // Brave turns Global Privacy Control on by default; this run is about Do Not Track alone.
     Object.defineProperty(Navigator.prototype, "globalPrivacyControl", { get: () => false, configurable: true });
   }, dnt);
-  if (micMode === "in-page") await ctx.addInitScript(inPageMic, WAV_B64);
+  if (micMode === "in-page") await ctx.addInitScript(inPageMic, { b64: WAV_B64 });
   const r = { events: [] as any[], bodies: [] as string[], scripts: 0, hosts: new Set<string>() };
   await ctx.route(`${LAB}/**`, async (route) => {
     const url = new URL(route.request().url());
