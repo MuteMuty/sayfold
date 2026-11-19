@@ -23,5 +23,18 @@ export function titleFrom(text: string): string {
   return t.charAt(0).toUpperCase() + t.slice(1);
 }
 
-/** Title, a blank line, then the text; either may be empty. */
-export const clipboardText = (title: string, text: string) => [title.trim(), text.trim()].filter(Boolean).join("\n\n");
+/** For comparing a title with the text: case, spacing and the end mark don't count. */
+const plain = (s: string) => s.replace(/\s+/g, " ").trim().replace(/[.!?…]+$/, "").toLowerCase();
+
+/** What Copy puts on the clipboard (the title, a blank line, then the text; either may be empty), and what it says. A title that's the whole text is copied once. */
+export function copyNote(title: string, text: string): { text: string; message: string } {
+  const t = title.trim();
+  const x = text.trim();
+  if (t && x && plain(t) === plain(x)) return { text: x, message: "Copied the text" };
+  if (t && x) return { text: `${t}\n\n${x}`, message: "Copied the title and text" };
+  if (x) return { text: x, message: "Copied the text" };
+  if (t) return { text: t, message: "Copied the title" };
+  return { text: "", message: "There's nothing to copy yet" };
+}
+
+export const clipboardText = (title: string, text: string) => copyNote(title, text).text;

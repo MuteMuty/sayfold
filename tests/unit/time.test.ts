@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { MAX_SECONDS, clock, capReached, secondsLeft } from "../../src/core/time.ts";
+import { MAX_SECONDS, clock, capReached, secondsLeft, cappedFrames } from "../../src/core/time.ts";
 
 test("a recording is capped at two minutes", () => {
   assert.equal(MAX_SECONDS, 120);
@@ -31,4 +31,17 @@ test("seconds left counts down to zero and never below", () => {
   assert.equal(secondsLeft(0), 120);
   assert.equal(secondsLeft(100.5), 19.5);
   assert.equal(secondsLeft(130), 0);
+});
+
+test("a recording stopped by the cap keeps exactly two minutes, so the clock ends on 2:00", () => {
+  for (const rate of [16_000, 22_050, 44_100, 48_000, 96_000]) {
+    const kept = cappedFrames(rate * 120 + 128 * 7, rate);
+    assert.equal(kept, Math.ceil(120 * rate), `${rate} Hz`);
+    assert.equal(clock(kept / rate), "2:00", `${rate} Hz`);
+  }
+});
+
+test("a shorter recording keeps every frame", () => {
+  assert.equal(cappedFrames(48_000 * 5.5, 48_000), 264_000);
+  assert.equal(cappedFrames(0, 48_000), 0);
 });

@@ -12,6 +12,7 @@
   --accent: #c73b24;
   --on-accent: #ffffff;
   --accent-soft: rgba(199, 59, 36, 0.14);
+  --ok: #2f7d57;
   --focus: #17211d;
   --radius: 16px;
   --font-display: ui-rounded, "SF Pro Rounded", "Nunito", system-ui, -apple-system, "Segoe UI", sans-serif;
@@ -31,6 +32,7 @@
     --accent: #ff7a5c;
     --on-accent: #1d0d08;
     --accent-soft: rgba(255, 122, 92, 0.16);
+    --ok: #6fd39f;
     --focus: #e4ece7;
     color-scheme: dark;
   }
@@ -72,8 +74,7 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  flex-wrap: wrap;
-  gap: 0.25rem 1rem;
+  gap: 0.75rem;
   width: 100%;
   max-width: 600px;
   margin: 0 auto;
@@ -88,7 +89,36 @@ body {
   letter-spacing: -0.01em;
 }
 .mark { width: 28px; height: 28px; flex: none; }
+.brand-line {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.25rem 1rem;
+  min-width: 0;
+}
 .tagline { margin: 0; color: var(--ink-dim); font-size: 0.95rem; }
+
+/* GitHub: connect, or the repo you're connected to. A dot turns green once connected. */
+.gh-open {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  flex: none;
+  max-width: 15rem;
+  min-height: 40px;
+  padding: 0 0.85rem 0 0.75rem;
+  border: 1.5px solid var(--line-strong);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--ink);
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+.gh-open:hover { border-color: var(--ink-dim); }
+.gh-open-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gh-dot { width: 8px; height: 8px; flex: none; border-radius: 50%; background: var(--line-strong); }
+[data-github="on"] .gh-dot { background: var(--ok); }
 
 /* ---- the stage ---- */
 .stage {
@@ -186,7 +216,7 @@ kbd {
 [data-state="recording"] .help-recording { display: inline; }
 
 /* What shows in each state. */
-.work, .problem, .review { display: none; }
+.work, .problem, .review, .sent { display: none; }
 [data-state="idle"] .clock { color: var(--ink-dim); }
 [data-state="working"] .rec,
 [data-state="working"] .help,
@@ -198,8 +228,10 @@ kbd {
 [data-state="working"] .wave { opacity: 0.45; }
 [data-state="working"] .clock { color: var(--ink-dim); }
 [data-state="problem"] .problem { display: flex; }
-[data-state="review"] .capture { display: none; }
+[data-state="review"] .capture,
+[data-state="sent"] .capture { display: none; }
 [data-state="review"] .review { display: flex; }
+[data-state="sent"] .sent { display: flex; }
 
 /* ---- working: model download and transcription ---- */
 .work {
@@ -251,9 +283,11 @@ kbd {
 button {
   font: inherit;
   color: inherit;
+  -webkit-tap-highlight-color: transparent;
 }
 .actions button,
 .problem button,
+.sent button,
 .like {
   min-height: 44px;
   padding: 0 1.15rem;
@@ -265,9 +299,23 @@ button {
 }
 .actions button:hover,
 .problem button:hover,
+.sent button:hover,
 .like:hover { border-color: var(--ink-dim); }
 button.primary { background: var(--ink); border-color: var(--ink); color: var(--paper); }
 button.primary:hover { border-color: var(--ink); opacity: 0.9; }
+.actions button:disabled { opacity: 0.55; cursor: default; }
+.actions button[aria-busy] { cursor: progress; }
+/* A button that reads as a link, for small follow-ups. */
+.linkish {
+  padding: 0.25rem 0;
+  border: none;
+  background: none;
+  color: var(--ink);
+  font-weight: 600;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
 button:focus-visible,
 a:focus-visible { outline: 2.5px solid var(--focus); outline-offset: 3px; }
 
@@ -287,7 +335,8 @@ a:focus-visible { outline: 2.5px solid var(--focus); outline-offset: 3px; }
   background: var(--card);
 }
 /* The folded corner. */
-.note::after {
+.note::after,
+.sent-card::after {
   content: "";
   position: absolute;
   top: -1px;
@@ -326,6 +375,140 @@ a:focus-visible { outline: 2.5px solid var(--focus); outline-offset: 3px; }
 
 .actions { display: flex; flex-wrap: wrap; gap: 0.6rem; }
 
+/* ---- labels: the repo's own, as chips you tick ---- */
+.labels { min-width: 0; margin: 0; padding: 0; border: none; }
+.labels legend { padding: 0 0 0.45rem; }
+.chips { display: flex; flex-wrap: wrap; gap: 0.45rem; }
+.chip {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  min-height: 40px;
+  padding: 0 0.85rem 0 0.7rem;
+  border: 1.5px solid var(--line-strong);
+  border-radius: 999px;
+  color: var(--ink-dim);
+  font-size: 0.9rem;
+  font-weight: 600;
+  cursor: pointer;
+  user-select: none;
+}
+/* The real checkbox covers the chip, unseen, so it stays a checkbox for keyboards and screen readers. */
+.chip input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: pointer; }
+.chip-dot { width: 10px; height: 10px; flex: none; border-radius: 50%; background: var(--c, var(--line-strong)); box-shadow: inset 0 0 0 1px var(--line); }
+.chip:hover { border-color: var(--ink-dim); color: var(--ink); }
+.chip:has(input:checked) { background: var(--ink); border-color: var(--ink); color: var(--paper); }
+.chip:has(input:checked) .chip-dot { box-shadow: 0 0 0 1.5px var(--paper); }
+.chip:has(input:focus-visible) { outline: 2.5px solid var(--focus); outline-offset: 3px; }
+
+/* ---- sending ---- */
+.send-to { margin: -0.35rem 0 0; color: var(--ink-dim); font-size: 0.88rem; }
+.send-problem {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.2rem;
+  padding: 0.75rem 1rem;
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  border-radius: 12px;
+  background: var(--accent-soft);
+}
+.send-problem-text { margin: 0; }
+
+/* ---- sent: the folded note again, with a tick ---- */
+.sent {
+  flex: 1;
+  align-items: center;
+  justify-content: center;
+  min-height: 420px;
+}
+.sent-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.7rem;
+  width: 100%;
+  max-width: 26rem;
+  padding: 2rem 1.5rem 1.75rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius) 0 var(--radius) var(--radius);
+  background: var(--card);
+  text-align: center;
+}
+.sent-mark { width: 52px; height: 52px; color: var(--ink); }
+.sent-title { margin: 0; font: 700 1.35rem/1.3 var(--font-display); }
+.sent-title:focus { outline: none; }
+.sent-body { margin: 0 0 0.5rem; color: var(--ink-dim); }
+.sent-body a { color: var(--ink); font-weight: 600; text-underline-offset: 3px; overflow-wrap: anywhere; }
+
+/* ---- connecting to GitHub ---- */
+.gh {
+  width: min(31rem, calc(100% - 32px));
+  max-width: none;
+  max-height: calc(100dvh - 32px);
+  padding: 1.4rem 1.35rem 1.35rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--card);
+  color: var(--ink);
+  box-shadow: 0 24px 60px -24px rgba(0, 0, 0, 0.45);
+  overflow: auto;
+}
+.gh::backdrop { background: rgba(10, 16, 13, 0.5); }
+.gh-form,
+.gh-on { display: flex; flex-direction: column; }
+.gh[data-mode="form"] .gh-on,
+.gh[data-mode="on"] .gh-form { display: none; }
+.gh-title { margin: 0 0 0.35rem; font: 700 1.3rem/1.3 var(--font-display); }
+.gh-intro { margin: 0 0 1.1rem; color: var(--ink-dim); font-size: 0.92rem; }
+.gh-intro a { color: var(--ink); font-weight: 600; text-underline-offset: 3px; overflow-wrap: anywhere; }
+.gh .field-label { padding: 0; }
+.field {
+  width: 100%;
+  min-height: 44px;
+  margin: 0.3rem 0 0.9rem;
+  padding: 0.5rem 0.75rem;
+  border: 1.5px solid var(--line-strong);
+  border-radius: 10px;
+  background: var(--paper);
+  color: var(--ink);
+  font: 1rem/1.4 var(--font-body);
+}
+.field::placeholder { color: var(--ink-dim); opacity: 0.8; }
+.field:focus { outline: none; border-color: var(--ink); box-shadow: 0 0 0 1px var(--ink); }
+.field[aria-invalid="true"] { border-color: var(--accent); }
+.err { margin: -0.55rem 0 0.9rem; color: var(--accent); font-size: 0.86rem; font-weight: 600; }
+.err:empty { display: none; }
+.howto {
+  margin: 0 0 0.9rem;
+  padding: 0.75rem 0.9rem 0.75rem 2.1rem;
+  border-radius: 12px;
+  background: var(--paper);
+  color: var(--ink-dim);
+  font-size: 0.86rem;
+}
+.howto li + li { margin-top: 0.3rem; }
+.howto strong { color: var(--ink); font-weight: 600; }
+.howto a { color: var(--ink); font-weight: 600; text-underline-offset: 3px; }
+.check { display: flex; align-items: center; gap: 0.6rem; min-height: 44px; font-weight: 600; cursor: pointer; }
+.check input { width: 20px; height: 20px; margin: 0; accent-color: var(--ink); }
+.check input:focus-visible { outline: 2.5px solid var(--focus); outline-offset: 3px; }
+.hint { margin: 0 0 1rem; color: var(--ink-dim); font-size: 0.86rem; }
+.gh-err,
+.gh-note {
+  margin: 0 0 1rem;
+  padding: 0.65rem 0.85rem;
+  border-radius: 10px;
+  color: var(--ink);
+  font-size: 0.9rem;
+  font-weight: 500;
+}
+.gh-err { background: var(--accent-soft); }
+.gh-note { background: var(--fold); }
+.gh-note:empty { display: none; }
+
 .promise {
   margin: 1.25rem auto 0;
   max-width: 30rem;
@@ -340,12 +523,10 @@ a:focus-visible { outline: 2.5px solid var(--focus); outline-offset: 3px; }
   align-items: center;
   gap: 0.35rem;
   min-height: 32px;
-  margin-right: 0.35rem;
   padding: 0 0.7rem 0 0.6rem;
   color: var(--ink-dim);
   font-size: 0.85rem;
   font-variant-numeric: tabular-nums;
-  vertical-align: middle;
 }
 .heart { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linejoin: round; overflow: visible; transition: fill 0.15s, stroke 0.15s; }
 .like[aria-pressed="true"] { border-color: color-mix(in srgb, var(--accent) 55%, transparent); color: var(--ink); }
@@ -377,12 +558,38 @@ a:focus-visible { outline: 2.5px solid var(--focus); outline-offset: 3px; }
 .toast.show { opacity: 1; transform: none; }
 
 .foot { padding: 0.5rem 16px calc(0.9rem + env(safe-area-inset-bottom)); text-align: center; }
-.foot p { margin: 0; color: var(--ink-dim); font-size: 0.8rem; }
+/* The like pill, the credit and the links, centred on one line; on a phone the links wrap together. */
+.foot p {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 0.3rem 0.5rem;
+  margin: 0;
+  color: var(--ink-dim);
+  font-size: 0.8rem;
+}
+.made, .more { white-space: nowrap; }
 .foot a { color: inherit; text-underline-offset: 2px; }
 .foot a:hover { color: var(--ink); }
 
+@media (max-width: 480px) {
+  /* The GitHub setup rises from the bottom on a phone. */
+  .gh {
+    width: 100%;
+    margin: auto 0 0;
+    max-height: calc(100dvh - 24px);
+    padding-bottom: calc(1.35rem + env(safe-area-inset-bottom));
+    border-radius: var(--radius) var(--radius) 0 0;
+  }
+}
+
 @media (max-width: 420px) {
-  .capture { min-height: 380px; }
+  .capture, .sent { min-height: 380px; }
+  /* Send across the whole width, with Copy and Record again side by side under it. */
+  .review .actions button { flex: 1 1 auto; }
+  .review .actions #send { flex-basis: 100%; }
+  .gh-open { max-width: 10.5rem; }
   .rec { width: 136px; height: 136px; margin: 10px 0; }
   .clock { font-size: 2.1rem; }
 }

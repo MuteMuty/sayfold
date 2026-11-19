@@ -1,8 +1,9 @@
 // Sayfold's usage events: the only ones it may send (lab SAFETY.md, "Usage events", lab#71), following
 // the lab-wide convention: `$pageview`, then `play_started` when a recording starts and `play_finished`
 // when its transcript is ready to review. The finish carries only how long the recording was, in
-// buckets, and which backend turned it into text. Nothing anyone said or typed is ever sent: no audio,
-// transcript, title, word counts or anything else taken from them.
+// buckets, and which backend turned it into text. `idea_sent` says an idea went to GitHub as an issue,
+// and nothing else: never the repo, the token, the labels, or whether a token is remembered. Nothing
+// anyone said or typed is ever sent: no audio, transcript, title, word counts or anything else taken from them.
 // Adding an event or value here is a normal commit; anything new in kind needs Erik.
 import type { AllowList, Props } from "./analytics.ts";
 
@@ -18,6 +19,7 @@ export const EVENTS = {
   $pageview: {},
   play_started: {},
   play_finished: { seconds_bucket: SECONDS, backend: ["webgpu", "wasm"] },
+  idea_sent: {},
 } satisfies AllowList;
 
 export function secondsBucket(seconds: number): string {

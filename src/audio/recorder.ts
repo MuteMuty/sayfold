@@ -1,7 +1,7 @@
 // The microphone, kept in memory only while recording: raw samples from an AudioWorklet, plus an
 // AnalyserNode for the live waveform. Stopping releases the microphone and hands back the samples, in one channel.
 import workletUrl from "./capture.worklet.ts?worker&url";
-import { capReached, MAX_SECONDS } from "../core/time.ts";
+import { capReached, cappedFrames } from "../core/time.ts";
 import { toMono } from "../core/resample.ts";
 
 export interface Recording {
@@ -85,7 +85,7 @@ export class Recorder {
     for (const t of this.stream.getTracks()) t.stop();
     const rate = this.ctx.sampleRate;
     await this.ctx.close().catch(() => {});
-    const all = new Float32Array(Math.min(this.frames, Math.ceil(MAX_SECONDS * rate)));
+    const all = new Float32Array(cappedFrames(this.frames, rate));
     let at = 0;
     for (const c of this.chunks) {
       if (at >= all.length) break;
