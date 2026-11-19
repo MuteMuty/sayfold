@@ -1,0 +1,5 @@
+# The speech model (Moonshine tiny, see README) is committed as is: binary, never diffed or merged.
+public/models/** -diff -merge linguist-vendored
+public/models/**/*.onnx binary
+# The playtest's spoken clip, made locally with macOS `say` (see tests/playtest.ts).
+tests/fixtures/*.wav binary

@@ -1,0 +1,23 @@
+{
+  "name": "sayfold",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "typecheck": "tsc -p . --noEmit && tsc -p tests",
+    "test": "tsc -p tests && node --test \"tests/unit/*.test.ts\"",
+    "build": "tsc -p . --noEmit && vite build",
+    "preview": "vite preview",
+    "playtest": "node tests/playtest.ts"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "4.3.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "playwright": "^1.52.0",
+    "typescript": "5.8.3",
+    "vite": "6.3.5",
+    "wrangler": "4.160.0"
+  }
+}

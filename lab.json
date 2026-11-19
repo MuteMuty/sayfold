@@ -1,0 +1,14 @@
+{
+  "name": "sayfold",
+  "url": "https://sayfold.brightloopapps.com",
+  "worker": "sayfold",
+  "commands": {
+    "install": "npm ci",
+    "test": "npm test",
+    "build": "npm run build",
+    "serve": "npx vite preview --port {port} --strictPort",
+    "playtest": "node tests/playtest.ts",
+    "deploy": "npx wrangler deploy"
+  },
+  "smoke": ["/"]
+}
