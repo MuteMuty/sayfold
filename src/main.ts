@@ -138,7 +138,12 @@ let last: Recording | null = null;
 let levels: number[] = [];
 
 async function start() {
-  if (state === "starting" || state === "recording" || state === "working") return;
+  // While an idea is on its way to GitHub, its answer decides what comes next.
+  if (state === "starting" || state === "recording" || state === "working" || sending) return;
+  // Never two microphones at once: let go of any earlier one first.
+  const previous = recorder;
+  recorder = null;
+  if (previous) void previous.stop();
   setState("starting");
   say("Asking for the microphone");
   // First use: the model starts loading now, while you talk.
@@ -383,16 +388,22 @@ function renderSend() {
   sendBtn.textContent = b.label;
   sendBtn.disabled = b.disabled;
   sendBtn.toggleAttribute("aria-busy", sending);
+  // Nothing else starts until GitHub answers.
+  for (const id of ["#copy", "#again"]) $<HTMLButtonElement>(id).disabled = sending;
   ghConnect.textContent = checking ? "Checking…" : online() ? "Connect" : "Waiting for a connection…";
   ghConnect.disabled = checking || !online();
 }
 
+/** What's said under Send now, so the offline note can go when the connection is back. */
+let sendProblemKind: GitHubProblem["kind"] | null = null;
 function showSendProblem(p: GitHubProblem) {
+  sendProblemKind = p.kind;
   sendProblem.hidden = false;
   sendProblemText.textContent = `${p.message} Your text is still here.`;
   $("#send-reconnect").hidden = !p.reconnect;
 }
 function hideSendProblem() {
+  sendProblemKind = null;
   sendProblem.hidden = true;
   sendProblemText.textContent = "";
 }
@@ -527,21 +538,29 @@ sendBtn.addEventListener("click", async () => {
   const r = await send((...a) => fetch(...a), c.repo, c.token, issue, { online });
   sending = false;
   renderSend();
+  const where = r.ok ? (r.number ? `issue #${r.number} in ${repoName(c.repo)}` : `an issue in ${repoName(c.repo)}`) : "";
+  if (r.ok) track("idea_sent");
+  // Only the review screen moves on with the answer; anywhere else it's just a note.
+  if (state !== "review") return toast(r.ok ? `Sent to GitHub as ${where}.` : r.problem.message);
   if (!r.ok) {
     showSendProblem(r.problem);
+    // Back on Send (or on the problem, while Send waits for a connection), not at the top of the page.
+    (sendBtn.disabled ? sendProblemText : sendBtn).focus();
     return;
   }
-  track("idea_sent");
   const a = $<HTMLAnchorElement>("#sent-link");
   a.href = r.url;
-  a.textContent = r.number ? `issue #${r.number} in ${repoName(c.repo)}` : `an issue in ${repoName(c.repo)}`;
+  a.textContent = where;
   setState("sent");
   say(`Sent to GitHub as ${a.textContent}`);
   $("#next").focus();
 });
 
 // Sending waits while the browser is offline, and the button comes back by itself with the connection.
-addEventListener("online", renderSend);
+addEventListener("online", () => {
+  if (sendProblemKind === "offline") hideSendProblem();
+  renderSend();
+});
 addEventListener("offline", renderSend);
 renderLink();
 

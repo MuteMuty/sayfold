@@ -17,6 +17,7 @@ const TOKEN = "github_pat_11FAKEFAKEFAKE_0123456789abcdef";
 test("a repo as owner/name", () => {
   assert.deepEqual(parseRepo("ada/ideas"), REPO);
   assert.deepEqual(parseRepo("  ada/ideas  "), REPO);
+  assert.deepEqual(parseRepo("ada/ideas/"), REPO, "a trailing slash, as a github.com link allows");
   assert.deepEqual(parseRepo("Some-Org/my.repo_2"), { owner: "Some-Org", name: "my.repo_2" });
 });
 

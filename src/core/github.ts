@@ -17,7 +17,8 @@ const NAME = /^[A-Za-z0-9._-]{1,100}$/;
 
 /** owner/name, a github.com link (with or without https://, www., .git or a deeper page) or an SSH address, or null. */
 export function parseRepo(input: string): Repo | null {
-  let s = input.trim();
+  // One trailing slash is fine, as it is on a github.com link.
+  let s = input.trim().replace(/\/$/, "");
   const ssh = /^git@github\.com:(.+)$/.exec(s);
   let path: string[];
   if (ssh) path = ssh[1]!.split("/");

@@ -118,7 +118,7 @@ type Seen = { url: string; method: string; size?: number; status?: number; heade
 type GhAnswer = "ok" | number | "rate" | "down";
 /** A stateful stand-in for api.github.com: the repo, its labels, and creating issues. */
 async function mockGitHub(ctx, origin: string) {
-  const gh = { repo: "ok" as GhAnswer, labels: "ok" as GhAnswer, issue: "ok" as GhAnswer, calls: [] as string[], auth: new Set<string>(), issues: [] as any[] };
+  const gh = { repo: "ok" as GhAnswer, labels: "ok" as GhAnswer, issue: "ok" as GhAnswer, delay: 0, calls: [] as string[], auth: new Set<string>(), issues: [] as any[] };
   await ctx.route(`${GITHUB}/**`, async (route) => {
     const req = route.request();
     const url = new URL(req.url());
@@ -139,6 +139,8 @@ async function mockGitHub(ctx, origin: string) {
       return answer(gh.labels, () => json(200, [{ name: "bug", color: "d73a4a" }, { name: "idea", color: "a2eeef" }, { name: "later", color: "fbca04" }]));
     }
     if (req.method() === "POST" && url.pathname === `/repos/${REPO}/issues`) {
+      // A slow answer, for what the page does while an idea is on its way.
+      if (gh.delay) await new Promise((r) => setTimeout(r, gh.delay));
       return answer(gh.issue, () => {
         gh.issues.push(JSON.parse(req.postData() || "{}"));
         const number = 41 + gh.issues.length;
@@ -272,6 +274,26 @@ async function record(page, label: string, seconds: number, startStop: () => Pro
   await waitState(page, ["review", "problem"], 180000);
   return Date.now() - t0;
 }
+
+/** In the page: every microphone stream it gets, the most tracks live at once, and each state it shows, in order. */
+function watchMic() {
+  const w = window as any;
+  w.__watch = { streams: [] as MediaStream[], maxLive: 0, states: [] as string[] };
+  const md = navigator.mediaDevices;
+  const ask = md.getUserMedia.bind(md);
+  md.getUserMedia = async (c) => {
+    const s = await ask(c);
+    w.__watch.streams.push(s);
+    const live = w.__watch.streams.flatMap((x: MediaStream) => x.getTracks()).filter((t: MediaStreamTrack) => t.readyState === "live").length;
+    w.__watch.maxLive = Math.max(w.__watch.maxLive, live);
+    return s;
+  };
+  new MutationObserver(() => {
+    const now = document.body?.dataset.state;
+    if (now && w.__watch.states.at(-1) !== now) w.__watch.states.push(now);
+  }).observe(document, { subtree: true, attributes: true, attributeFilter: ["data-state"] });
+}
+const liveTracks = (page) => page.evaluate(() => (window as any).__watch.streams.flatMap((s: MediaStream) => s.getTracks()).filter((t: MediaStreamTrack) => t.readyState === "live").length);
 
 const modelRequests = (seen: Seen[]) => seen.filter((s) => new URL(s.url).origin === own && /\/models\/|\.wasm$/.test(new URL(s.url).pathname));
 
@@ -680,6 +702,7 @@ await check("send, phone", async () => {
     assert.match(text, message, String(answer));
     assert.match(text, /Your text is still here/);
     assert.equal(await page.isVisible("#send-reconnect"), reconnect, `${answer}: Connect again`);
+    assert.equal(await focused(page), "send", `${answer}: focus isn't back on Send`);
     assert.equal(await state(page), "review");
     assert.equal(await page.inputValue("#text"), said, "the text changed");
     if (answer === 403) await shot(page, "phone-send-error-light");
@@ -695,6 +718,18 @@ await check("send, phone", async () => {
   await page.waitForFunction(() => !document.querySelector<HTMLButtonElement>("#send").disabled);
   assert.equal(await page.textContent("#send"), "Send to GitHub");
   assert.equal(await page.inputValue("#text"), said);
+
+  // Offline while an idea is on its way: "You're offline" goes by itself when the connection is back.
+  Object.assign(gh, { issue: "down", delay: 800 });
+  await page.locator("#send").tap();
+  await ctx.setOffline(true);
+  await page.waitForFunction(() => /offline/.test(document.querySelector("#send-problem-text").textContent), null, { timeout: 5000 });
+  assert.equal(await focused(page), "send-problem-text", "focus isn't on the problem while Send waits");
+  await ctx.setOffline(false);
+  await page.waitForFunction(() => document.querySelector<HTMLElement>("#send-problem").hidden, null, { timeout: 3000 }).catch(() => {
+    throw new Error("the offline message stayed after the connection came back");
+  });
+  gh.delay = 0;
 
   gh.issue = "ok";
   await page.locator("#send").tap();
@@ -713,6 +748,41 @@ await check("send, phone", async () => {
   assert.equal(await page.evaluate(() => localStorage.getItem("sayfold:github")), null);
   assert.equal(await page.evaluate(() => window.__sayfold.connected()), false);
   tokenOnlyToGitHub("send, phone", seen);
+  await ctx.close();
+});
+
+// --- a slow send: nothing can start a recording until GitHub answers, and the microphone always ends ----------
+await check("send race", async () => {
+  const { ctx, page, gh } = await openPage("send race", { viewport: { width: 390, height: 844 }, colorScheme: "light" }, { init: watchMic });
+  await record(page, "send race", 3, () => page.locator("#rec").click());
+  assert.equal(await state(page), "review", await page.textContent("#problem-title"));
+  // owner/name with a trailing slash connects, as the same slash on a github.com link does.
+  await page.locator("#send").click();
+  await page.fill("#gh-repo", `${REPO}/`);
+  await page.fill("#gh-token", TOKEN);
+  await page.locator("#gh-connect").click();
+  await page.waitForFunction(() => !document.querySelector<HTMLDialogElement>("#gh").open, null, { timeout: 5000 }).catch(async () => {
+    throw new Error(`"${REPO}/" didn't connect: ${await page.textContent("#gh-repo-err")}`);
+  });
+  assert.equal(await page.textContent("#gh-open-label"), REPO);
+
+  gh.delay = 2500;
+  await page.locator("#send").click();
+  await page.waitForTimeout(300);
+  for (const id of ["#again", "#copy"]) assert.equal(await page.isDisabled(id), true, `${id} can be pressed while sending`);
+  await page.locator("#again").click({ force: true });
+  await page.locator("#copy").click({ force: true });
+  await waitState(page, ["sent"], 6000);
+  const states: string[] = await page.evaluate(() => (window as any).__watch.states);
+  assert.deepEqual(states.slice(states.lastIndexOf("review")), ["review", "sent"], `states after Send: ${states.join(" > ")}`);
+  assert.equal(gh.issues.length, 1);
+  assert.equal(await liveTracks(page), 0, "a microphone track is still live after sending");
+
+  // The next idea records with one microphone, and lets it go at Stop.
+  gh.delay = 0;
+  await record(page, "send race, next", 2, () => page.locator(":is(#next, #rec):visible").click());
+  assert.equal(await liveTracks(page), 0, "a microphone track is still live after the next idea");
+  assert.equal(await page.evaluate(() => (window as any).__watch.maxLive), 1, "two microphone tracks were live at once");
   await ctx.close();
 });
 
