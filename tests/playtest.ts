@@ -59,6 +59,11 @@ const browserPath = process.env.PLAYTEST_BROWSER || "/Applications/Brave Browser
 const WAV = join(repo, "tests/fixtures/idea.wav");
 const WAV_B64 = readFileSync(WAV).toString("base64");
 const EXPECTED_WORDS = ["tomatoes", "plumber", "friday"];
+/** A spoken list, said as the speech model hears it at a normal pace: it writes "Groceries for the weekend, list, milk,
+ *  bread, eggs, and list, then call the bank." (see tests/fixtures/list-transcripts.json for how it was made). */
+const LIST_WAV = readFileSync(join(repo, "tests/fixtures/list-commas.wav"));
+const LIST_B64 = LIST_WAV.toString("base64");
+const LIST_SECONDS = LIST_WAV.readUInt32LE(LIST_WAV.indexOf("data") + 4) / 32000;
 const LONG = readFileSync(join(repo, "tests/fixtures/long-idea.wav"));
 const LONG_B64 = LONG.toString("base64");
 /** Its length: the data chunk's bytes, at 16 kHz in 16 bits. */
@@ -895,12 +900,24 @@ await check("send race", async () => {
 await check("spoken list", async () => {
   for (const [size, viewport, mobile] of [["desktop", { width: 1280, height: 900 }, false], ["phone", { width: 390, height: 844 }, true]] as const) {
     const label = `spoken list, ${size}`;
-    const { ctx, page, seen, gh } = await openPage(label, { viewport, isMobile: mobile, hasTouch: mobile, colorScheme: "light" });
+    // On the desktop, a list really said: the speech model writes it with commas, not full stops.
+    const spoken = !mobile;
+    const { ctx, page, seen, gh } = await openPage(label, { viewport, isMobile: mobile, hasTouch: mobile, colorScheme: "light" }, spoken ? { mic: { b64: LIST_B64 } } : {});
     const press = (sel: string) => (mobile ? page.locator(sel).tap() : page.locator(sel).click());
     const items = () => page.$$eval("#preview li", (els) => els.map((e) => e.textContent));
-    await record(page, label, 5.5, () => press("#rec"));
+    const paras = () => page.$$eval("#preview-body p", (els) => els.map((e) => e.textContent));
+    await record(page, label, spoken ? LIST_SECONDS + 1 : 5.5, () => press("#rec"));
     assert.equal(await state(page), "review", await page.textContent("#problem-title"));
-    assert.equal(await page.isVisible("#preview"), false, "a list preview shows for the clip, which has no list");
+    if (spoken) {
+      const said = await page.inputValue("#text");
+      assert.equal(await page.isVisible("#preview"), true, `no preview for the spoken list "${said}"`);
+      assert.deepEqual(await items(), ["Milk", "Bread", "Eggs"], said);
+      assert.deepEqual(await paras(), ["Groceries for the weekend:", "Then call the bank."], said);
+      assert.equal(await page.inputValue("#title"), "Groceries for the weekend");
+      console.log(`${label}: "${said}" (${await page.evaluate(() => window.__sayfold.backend())})`);
+      await shots(page, `${size}-review-spoken-list`);
+      await page.emulateMedia({ colorScheme: "light" });
+    } else assert.equal(await page.isVisible("#preview"), false, "a list preview shows for the clip, which has no list");
 
     // Said as a list: the preview shows the items, and follows the text as it's edited, typed lines too.
     await page.fill("#text", "Groceries for the weekend. List. Milk. Bread.");
@@ -913,10 +930,18 @@ await check("spoken list", async () => {
     await page.locator("#text").press("Enter");
     await page.locator("#text").pressSequentially("oat milk");
     assert.deepEqual(await items(), ["Milk", "Bread", "Eggs", "Oat milk"]);
-    assert.deepEqual(await page.$$eval("#preview-body p", (els) => els.map((e) => e.textContent)), ["Groceries for the weekend."]);
+    assert.deepEqual(await paras(), ["Groceries for the weekend."]);
     await noSideScroll(page, label);
     await shots(page, `${size}-review-list`);
     await page.emulateMedia({ colorScheme: "light" });
+
+    // Copy copies what Send sends: the title, a blank line, and the body with its task list.
+    const body = "Groceries for the weekend.\n\n- [ ] Milk\n- [ ] Bread\n- [ ] Eggs\n- [ ] Oat milk";
+    await page.evaluate(() => document.querySelector("#toast").classList.remove("show"));
+    await press("#copy");
+    await page.waitForFunction(() => document.querySelector("#toast").classList.contains("show"));
+    assert.equal(await page.textContent("#toast"), "Copied the title and text");
+    assert.equal(await page.evaluate(() => navigator.clipboard.readText()), `Groceries for the weekend\n\n${body}`);
 
     // "list" inside a sentence is just a word, and the preview goes.
     const typed = await page.inputValue("#text");
@@ -934,7 +959,7 @@ await check("spoken list", async () => {
     await press("#send");
     await waitState(page, ["sent"], 5000);
     assert.deepEqual(gh.issues, [
-      { title: "Groceries for the weekend", body: "Groceries for the weekend.\n\n- [ ] Milk\n- [ ] Bread\n- [ ] Eggs\n- [ ] Oat milk", labels: ["idea"] },
+      { title: "Groceries for the weekend", body, labels: ["idea"] },
     ]);
     tokenOnlyToGitHub(label, seen);
     await ctx.close();
