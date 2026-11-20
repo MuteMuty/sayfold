@@ -373,6 +373,30 @@ a:focus-visible { outline: 2.5px solid var(--focus); outline-offset: 3px; }
 .title:focus,
 .text:focus { outline: none; border-color: var(--ink-dim); background: var(--paper); }
 
+.text-hint { margin: 0.4rem 0 0; padding: 0 calc(0.6rem + 1.5px); color: var(--ink-dim); font-size: 0.86rem; }
+
+/* A spoken list, as it will go to GitHub: quiet, under the note, with an empty box before each task. */
+.preview {
+  padding: 0.75rem 1rem 0.85rem;
+  border: 1.5px dashed var(--line-strong);
+  border-radius: 12px;
+}
+.preview .field-label { display: block; margin: 0 0 0.4rem; padding: 0; }
+.preview-body { color: var(--ink-dim); font-size: 0.92rem; overflow-wrap: anywhere; }
+.preview-body p { margin: 0 0 0.5rem; white-space: pre-line; }
+.preview-body ul { margin: 0 0 0.5rem; padding: 0; list-style: none; }
+.preview-body li { display: flex; gap: 0.55rem; padding: 0.1rem 0; color: var(--ink); }
+.preview-body li::before {
+  content: "";
+  flex: none;
+  width: 0.95em;
+  height: 0.95em;
+  margin-top: 0.3em;
+  border: 1.5px solid var(--line-strong);
+  border-radius: 4px;
+}
+.preview-body > :last-child { margin-bottom: 0; }
+
 .actions { display: flex; flex-wrap: wrap; gap: 0.6rem; }
 
 /* ---- labels: the repo's own, as chips you tick ---- */

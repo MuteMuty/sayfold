@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { titleFrom, TITLE_MAX, clipboardText, copyNote } from "../../src/core/title.ts";
+import { issueFrom } from "../../src/core/github.ts";
 
 test("the title is the first line", () => {
   assert.equal(titleFrom("Buy oat milk\nand bread too"), "Buy oat milk");
@@ -87,4 +88,41 @@ test("when the title is the whole transcript, copy gives it once", () => {
   assert.equal(clipboardText("Call  the plumber!", "call the plumber! "), "call the plumber!");
   // A title that's only the first sentence is still copied with the rest.
   assert.equal(clipboardText("Buy oat milk", "Buy oat milk. And bread."), "Buy oat milk\n\nBuy oat milk. And bread.");
+});
+
+test("the title is never the bare word \"List\": a list said first gives the next sentence or line", () => {
+  assert.equal(titleFrom("List. Milk. Bread."), "Milk");
+  assert.equal(titleFrom("list!\nmilk\nbread"), "Milk");
+  assert.equal(titleFrom("List."), "");
+  assert.equal(titleFrom("Groceries. List. Milk."), "Groceries");
+  assert.equal(titleFrom("List: milk, bread"), "Milk");
+  assert.equal(titleFrom("List. End list. Later."), "Later");
+  assert.equal(titleFrom("Listen to this. Then go."), "Listen to this");
+});
+
+test("the title of a spoken list is the words before it, however the speech model punctuated them", () => {
+  assert.equal(titleFrom("Things to try, list, dark mode, offline send, and a shortcut."), "Things to try");
+  assert.equal(titleFrom("Things to try, list: dark mode"), "Things to try");
+  assert.equal(titleFrom("Groceries for the weekend, list, milk, bread, eggs, and list, then call the bank."), "Groceries for the weekend");
+  assert.equal(titleFrom("Weekend\nat the cabin\nlist\nwood"), "Weekend");
+});
+
+test("copy copies the text as Send sends it: a spoken list as a task list, and any other text exactly as it is", () => {
+  assert.deepEqual(copyNote("Groceries for the weekend", "Groceries for the weekend, list, milk, bread, eggs, and list, then call the bank."), {
+    text: "Groceries for the weekend\n\nGroceries for the weekend:\n\n- [ ] Milk\n- [ ] Bread\n- [ ] Eggs\n\nThen call the bank.",
+    message: "Copied the title and text",
+  });
+  assert.deepEqual(copyNote("", "List. Milk. Bread."), { text: "- [ ] Milk\n- [ ] Bread", message: "Copied the text" });
+  // Only "list", with nothing after it: nothing to copy, as there's nothing to send.
+  assert.deepEqual(copyNote("", "List."), { text: "", message: "There's nothing to copy yet" });
+  for (const text of ["  My shopping list is long.\nMilk  ", "Read the report and list the costs.", " \tx\n\n y "]) {
+    assert.equal(clipboardText("T", text), `T\n\n${text.trim()}`);
+  }
+});
+
+test("copy is the same text part Send sends", () => {
+  for (const text of ["Groceries. List. Milk.", "Things to try, list, dark mode.", "Just an idea.", "List."]) {
+    const issue = issueFrom("", text, []);
+    assert.equal(copyNote("", text).text, issue?.body ?? "");
+  }
 });

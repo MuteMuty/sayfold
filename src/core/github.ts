@@ -2,6 +2,7 @@
 // own fine-grained token, limited to one repo, and everything goes straight from the browser to
 // api.github.com. Sayfold has no server. Plain logic: the page hands in fetch, so `node --test` can run it.
 import { titleFrom } from "./title.ts";
+import { bodyFrom } from "./list.ts";
 
 export const API = "https://api.github.com";
 /** Where to make a token, and the one permission it needs. */
@@ -71,10 +72,10 @@ export interface Issue { title: string; body: string; labels: string[] }
 export const issueRequest = (r: Repo, token: string, issue: Issue): [string, RequestInit] =>
   [`${path(r)}/issues`, init(token, { method: "POST", body: JSON.stringify({ title: issue.title, body: issue.body, labels: issue.labels }) })];
 
-/** The issue to create: the title (or one from the text when it's empty), and the text as its body. Null when there's nothing to send. */
+/** The issue to create: the title (or one from the text when it's empty), and the text as its body, with spoken lists as task lists. Null when there's nothing to send. */
 export function issueFrom(title: string, text: string, labels: string[]): Issue | null {
-  const body = text.trim();
-  const t = title.trim() || titleFrom(body);
+  const body = bodyFrom(text);
+  const t = title.trim() || titleFrom(text);
   if (!t) return null;
   return { title: t, body, labels };
 }
