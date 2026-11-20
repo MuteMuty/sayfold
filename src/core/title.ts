@@ -3,8 +3,14 @@
 export const TITLE_MAX = 72;
 const MIN_CLAUSE = 6;
 
-/** The first line, or its first sentence when the transcript is one paragraph, capitalised; a long one ends at a clause break or a word. */
+/** The first line, or its first sentence when the transcript is one paragraph, capitalised; a long one ends at a clause break or a word.
+ * A spoken "list" first is never the title: the next sentence or line is. */
 export function titleFrom(text: string): string {
+  const t = firstTitle(text);
+  return /^list[.!?]*$/i.test(t) ? titleFrom(text.replace(/^\s*list[.!?]*/i, "")) : t;
+}
+
+function firstTitle(text: string): string {
   const line = text.split("\n").map((l) => l.trim()).find((l) => l.length > 0) ?? "";
   // A sentence ends at . ! or ? followed by a space. A full stop is dropped; ! and ? are kept.
   const end = line.search(/[.!?](\s|$)/);

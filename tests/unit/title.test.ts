@@ -88,3 +88,12 @@ test("when the title is the whole transcript, copy gives it once", () => {
   // A title that's only the first sentence is still copied with the rest.
   assert.equal(clipboardText("Buy oat milk", "Buy oat milk. And bread."), "Buy oat milk\n\nBuy oat milk. And bread.");
 });
+
+test("the title is never the bare word \"List\": a list said first gives the next sentence or line", () => {
+  assert.equal(titleFrom("List. Milk. Bread."), "Milk");
+  assert.equal(titleFrom("list!\nmilk\nbread"), "Milk");
+  assert.equal(titleFrom("List."), "");
+  assert.equal(titleFrom("Groceries. List. Milk."), "Groceries");
+  assert.equal(titleFrom("List: milk, bread"), "List: milk, bread");
+  assert.equal(titleFrom("Listen to this. Then go."), "Listen to this");
+});

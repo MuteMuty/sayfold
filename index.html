@@ -65,8 +65,14 @@
           <label class="field-label" for="title">Title</label>
           <input id="title" class="title" type="text" autocomplete="off" spellcheck="true" maxlength="200" />
           <label class="field-label" for="text">Text</label>
-          <textarea id="text" class="text" rows="7" spellcheck="true"></textarea>
+          <textarea id="text" class="text" rows="7" spellcheck="true" aria-describedby="text-hint"></textarea>
+          <p id="text-hint" class="text-hint">Say “list” to start a task list, and “end list” to finish it.</p>
         </div>
+        <!-- How a spoken list goes to GitHub, shown only while the text has one. The text above is still what you edit. -->
+        <section id="preview" class="preview" aria-labelledby="preview-h" hidden>
+          <h3 id="preview-h" class="field-label">Sent as a task list</h3>
+          <div id="preview-body" class="preview-body"></div>
+        </section>
         <!-- Shown when a part of the recording that had speech in it came back empty or far too short. -->
         <p id="missing" class="missing" hidden>Part of the recording may be missing. Check the text before sending.</p>
         <!-- The repo's labels, as chips. `idea` is chosen at first when the repo has it. -->

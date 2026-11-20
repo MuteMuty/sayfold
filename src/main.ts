@@ -3,6 +3,7 @@ import { Recorder, type Recording } from "./audio/recorder.ts";
 import { Speech } from "./stt/client.ts";
 import { clock, MAX_SECONDS } from "./core/time.ts";
 import { titleFrom, copyNote } from "./core/title.ts";
+import { blocksFrom } from "./core/list.ts";
 import { micProblem, unsupported, MESSAGES, type Problem } from "./core/mic.ts";
 import { LoadProgress, megabytes } from "./core/progress.ts";
 import { MODEL } from "./stt/model.ts";
@@ -213,8 +214,8 @@ function showReview(text: string, gaps = false) {
   titleFollows = true;
   missingNote.hidden = !gaps;
   // A hidden note would still be read as the description, so it's only linked while it shows.
-  if (gaps) textIn.setAttribute("aria-describedby", "missing");
-  else textIn.removeAttribute("aria-describedby");
+  textIn.setAttribute("aria-describedby", gaps ? "missing text-hint" : "text-hint");
+  renderPreview();
   setState("review");
   say(gaps ? `Your idea is ready to review. ${missingNote.textContent}` : "Your idea is ready to review");
   textIn.focus();
@@ -223,8 +224,27 @@ function showReview(text: string, gaps = false) {
   if (link.current && !labels) void loadLabels();
 }
 
+const preview = $("#preview");
+const previewBody = $("#preview-body");
+const el = <K extends keyof HTMLElementTagNameMap>(tag: K, text = "") => Object.assign(document.createElement(tag), { textContent: text });
+
+/** A spoken list, as it will go to GitHub: shown only while the text has one, and redrawn from the text as it's edited. */
+function renderPreview() {
+  const blocks = blocksFrom(textIn.value);
+  preview.hidden = !blocks;
+  previewBody.replaceChildren(
+    ...(blocks ?? []).map((b) => {
+      if (b.kind === "text") return el("p", b.text);
+      const ul = el("ul");
+      ul.append(...b.items.map((i) => el("li", i)));
+      return ul;
+    }),
+  );
+}
+
 textIn.addEventListener("input", () => {
   if (titleFollows) titleIn.value = titleFrom(textIn.value);
+  renderPreview();
 });
 titleIn.addEventListener("input", () => {
   titleFollows = titleIn.value.trim() === "";
