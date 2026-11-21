@@ -12,5 +12,7 @@
     "verbatimModuleSyntax": true,
     "types": ["node", "vite/client"]
   },
-  "include": ["src", "tests/unit", "scripts", "vite.config.ts"]
+  "include": ["src", "tests/unit", "scripts", "vite.config.ts"],
+  // The Worker's entry needs the Workers runtime's types instead: src/server/tsconfig.json.
+  "exclude": ["src/server/index.ts"]
 }
