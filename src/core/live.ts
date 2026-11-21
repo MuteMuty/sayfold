@@ -13,9 +13,10 @@ export const OPEN_WAIT_MS = 5000;
 /** After stop, how long to wait for the server to close (it waits up to 3 s for the last words itself). */
 export const STOP_WAIT_MS = 5000;
 /**
- * When the server can't say how much audio it took (the socket dropped, or a fallback without `seconds`), the
- * in-browser model starts this many seconds before the last words came: the words lag the audio, so the last
- * ones may stand for speech well before they arrived. What both heard is shown once (joinText).
+ * When the server can't say how much audio it took (the socket dropped, or a fallback without `seconds`), or
+ * says it took more than its last words cover, the in-browser model starts this many seconds before the last
+ * words came: the words lag the audio, so the last ones may stand for speech well before they arrived. What
+ * both heard is shown once (joinText).
  */
 export const LAG_MARGIN = 1;
 /** The most words the live text's end and the in-browser model's start may share: about a second of speech. */
@@ -87,19 +88,20 @@ export class LiveText {
 const said = (w: string) => w.toLowerCase().replace(/[^\p{L}\p{N}']/gu, "");
 
 /**
- * The live text and the in-browser model's text for the rest, as one. The model may start a little before
- * the live text ended (LAG_MARGIN), so the words both heard show once: the longest run of the live text's
- * last words that the model's text starts with, after at most one cut-off word where its audio began. The
- * model starts every part with a capital, so when the live text stopped mid-sentence, a plain capitalised
- * word ("And", not "I" or "NASA") carries on in lower case.
+ * The live text and the in-browser model's text for the rest, as one. On an `exact` start, the model's audio
+ * begins where the server's words end, so nothing is heard twice and every word stays ("very very good").
+ * Otherwise the model started a little before the live text ended (LAG_MARGIN), so the words both heard show
+ * once: the longest run of the live text's last words that the model's text starts with, after at most one
+ * cut-off word where its audio began. The model starts every part with a capital, so when the live text
+ * stopped mid-sentence, a plain capitalised word ("And", not "I" or "NASA") carries on in lower case.
  */
-export function joinText(live: string, rest: string): string {
+export function joinText(live: string, rest: string, exact = false): string {
   const a = live.trim();
   let b = rest.trim();
   const tail = a.split(/\s+/).map(said);
   const head = b.split(/\s+/);
   const words = head.map(said);
-  find: for (let k = Math.min(MAX_OVERLAP, tail.length, words.length); k > 0; k--) {
+  find: for (let k = exact ? 0 : Math.min(MAX_OVERLAP, tail.length, words.length); k > 0; k--) {
     for (const skip of [0, 1]) {
       if (skip + k > words.length) continue;
       if (tail.slice(-k).every((w, i) => w && w === words[skip + i])) {
@@ -134,9 +136,13 @@ const WHY: Record<FallbackReason, string> = {
   error: "Live text isn't working right now",
 };
 
-/** What the page says when the in-browser model takes over: for the whole recording, or the rest of it. */
-export function fallbackNote(reason: FallbackReason, partial: boolean): string {
-  return `${WHY[reason]}, so ${partial ? "the rest is" : "it's"} turned into text on this device.`;
+/**
+ * What the page says when the in-browser model takes over: for the whole recording, or the rest of it. When
+ * audio went to the server but the model starts from the beginning, it doesn't sound as if none was sent.
+ */
+export function fallbackNote(reason: FallbackReason, partial: boolean, sent: boolean): string {
+  if (partial) return `${WHY[reason]}, so the rest is turned into text on this device.`;
+  return `${WHY[reason]}, so it's turned into text on this device${sent ? ", from the start" : ""}.`;
 }
 
 /** The browser's WebSocket, as far as LiveSession uses it. */
@@ -153,11 +159,13 @@ export interface SocketLike {
 
 /**
  * How a recording's live text ended: the text, and `from`, the second of the recording from which the
- * in-browser model takes over (null when the server heard all of it), with the reason it did.
+ * in-browser model takes over (null when the server heard all of it), with the reason it did. `exact`: the
+ * model starts just where the server's words end, so none is heard twice (otherwise a margin earlier).
  */
 export interface LiveEnd {
   text: string;
   from: number | null;
+  exact: boolean;
   reason: FallbackReason | null;
 }
 
@@ -284,21 +292,23 @@ export class LiveSession {
   /** The socket closed: the end of the stream after stop, otherwise a fallback. */
   private closed(): void {
     if (this.state === "ended") return;
-    if (this.state === "stopping") return this.end({ text: this.live.text, from: null, reason: null });
+    if (this.state === "stopping") return this.end({ text: this.live.text, from: null, exact: true, reason: null });
     this.fallBack("error", null);
   }
 
   /**
    * The server can't take (the rest of) this recording. The text so far stays. The in-browser model takes
-   * over from the audio the server took (`taken`, in seconds), and never later than where the last words
-   * came: anything said after them may not have been heard. When it's unknown (the connection failed, or the
-   * fallback didn't say), the last words may stand for audio from well before they came, so it starts
-   * LAG_MARGIN earlier, and joinText drops what both heard.
+   * over exactly from the audio the server took (`taken`, in seconds) when its last words came after it, as
+   * they do once the server has drained Flux. Otherwise (the connection failed, the fallback didn't say, or
+   * the server took audio after its last words, which may be unheard or cut mid-word) the last words may
+   * stand for audio from well before they came, so it starts LAG_MARGIN before them, and joinText drops
+   * what both heard.
    */
   private fallBack(reason: FallbackReason, taken: number | null): void {
     if (this.state === "ended") return;
-    const from = taken === null ? Math.max(0, this.heardTo - LAG_MARGIN) : Math.min(taken, this.heardTo);
-    const end: LiveEnd = { text: this.live.text, from, reason };
+    const exact = taken !== null && taken <= this.heardTo;
+    const from = exact ? taken : Math.max(0, this.heardTo - LAG_MARGIN);
+    const end: LiveEnd = { text: this.live.text, from, exact, reason };
     this.end(end);
     this.on.fallback(end);
   }

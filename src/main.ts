@@ -138,7 +138,7 @@ function showTranscribing(note = "") {
 /** Where the in-browser model is turning this recording into text, and why. */
 function onDevice(): string {
   const end = liveEnd;
-  return end?.reason ? fallbackNote(end.reason, (end.from ?? 0) > 0) : "On this device. This recording stays here.";
+  return end?.reason ? fallbackNote(end.reason, (end.from ?? 0) > 0, liveSent) : "On this device. This recording stays here.";
 }
 
 // --- live text (lab#109) -----------------------------------------------------------------------
@@ -190,7 +190,7 @@ function openLive() {
       // Off for the next recordings. The line under the button changes once this one ends, and says part of it was sent.
       if (end.reason === "cap" || end.reason === "visitor-limit") liveOn = false;
       if (session === s) {
-        liveNote.textContent = fallbackNote(end.reason!, (end.from ?? 0) > 0);
+        liveNote.textContent = fallbackNote(end.reason!, (end.from ?? 0) > 0, s.sentAudio);
         liveNote.hidden = false;
       }
     },
@@ -298,7 +298,7 @@ async function transcribe() {
     localSeconds = rest.length / rec.rate;
     const result = await speech.transcribe(rest, rec.rate);
     backend = result.backend;
-    finish(rec, joinText(heard, result.text), result.backend, result.gaps);
+    finish(rec, joinText(heard, result.text, liveEnd?.exact ?? false), result.backend, result.gaps);
   } catch (e) {
     console.warn("Sayfold: transcription failed:", e);
     // The recording stays, so Try again doesn't need a new one.
@@ -751,7 +751,7 @@ declare global {
   interface Window {
     __sayfold?: {
       state(): State; backend(): Backend | null; seconds(): number | null; modelReady(): boolean; connected(): boolean;
-      live(): { on: boolean | null; reason: string | null; from: number | null; sent: boolean; localSeconds: number | null; by: Finisher | null };
+      live(): { on: boolean | null; reason: string | null; from: number | null; exact: boolean | null; sent: boolean; localSeconds: number | null; by: Finisher | null };
     };
   }
 }
@@ -761,5 +761,5 @@ window.__sayfold = {
   seconds: () => last?.seconds ?? null,
   modelReady: () => speech.ready,
   connected: () => link.current !== null,
-  live: () => ({ on: liveOn, reason: liveEnd?.reason ?? null, from: liveEnd?.from ?? null, sent: liveSent, localSeconds, by: finishedBy }),
+  live: () => ({ on: liveOn, reason: liveEnd?.reason ?? null, from: liveEnd?.from ?? null, exact: liveEnd?.exact ?? null, sent: liveSent, localSeconds, by: finishedBy }),
 };

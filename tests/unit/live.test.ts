@@ -130,6 +130,23 @@ test("joining: words the in-browser model heard again where the live text ended 
   assert.equal(joinText("", "The plumber."), "The plumber.");
 });
 
+test("joining on an exact start: the in-browser model's audio begins where the server's ended, so a word said twice stays twice", () => {
+  // The server said how much audio it took, and its words cover it: nothing is heard twice, so nothing is dropped.
+  assert.equal(joinText("The soup was very", "Very good.", true), "The soup was very very good.");
+  assert.equal(joinText("And then I said no", "No, thank you.", true), "And then I said no no, thank you.");
+  assert.equal(joinText("Go go", "Go.", true), "Go go go.");
+  // The capital mid-sentence still goes, and a sentence's end still keeps it.
+  assert.equal(joinText("Water the tomatoes every morning,", "And call the plumber.", true), "Water the tomatoes every morning, and call the plumber.");
+  assert.equal(joinText("The soup was very good.", "Very good.", true), "The soup was very good. Very good.");
+  assert.equal(joinText("", "Very good.", true), "Very good.");
+});
+
+test("joining on a margin start: the words re-heard show once, and a repeat said before the margin stays", () => {
+  // The connection went after "The soup was very": the model, a margin earlier, heard "was very" again.
+  assert.equal(joinText("The soup was very", "Was very very good.", false), "The soup was very very good.");
+  assert.equal(joinText("The soup was very", "Very very good."), "The soup was very very good.");
+});
+
 test("the line under the button: on this device only for a recording that really stays on it", () => {
   const send = /^Your words go to your own GitHub repo only when you press Send\.$/;
   const tail = (s: string) => s.slice(s.indexOf("Your words"));
@@ -150,14 +167,19 @@ test("notes: a short plain line for each reason, saying what happens next", () =
   const reasons: FallbackReason[] = ["cap", "visitor-limit", "busy", "session-limit", "idle", "error"];
   for (const r of reasons) {
     for (const partial of [true, false]) {
-      const n = fallbackNote(r, partial);
+      const n = fallbackNote(r, partial, false);
       assert.match(n, partial ? /so the rest is turned into text on this device\.$/ : /so it's turned into text on this device\.$/, n);
       assert.ok(n.length < 110, n);
     }
+    // Audio went to the server, but the in-browser model starts over from the beginning: never said as if none left.
+    const sent = fallbackNote(r, false, true);
+    assert.match(sent, /, so it's turned into text on this device, from the start\.$/, sent);
+    assert.ok(sent.length < 110, sent);
+    assert.equal(fallbackNote(r, true, true), fallbackNote(r, true, false));
   }
-  assert.match(fallbackNote("cap", false), /^Live text is used up for today/);
-  assert.match(fallbackNote("visitor-limit", true), /^You've used your live text for today/);
-  assert.match(fallbackNote("busy", false), /another tab/);
+  assert.match(fallbackNote("cap", false, false), /^Live text is used up for today/);
+  assert.match(fallbackNote("visitor-limit", true, true), /^You've used your live text for today/);
+  assert.match(fallbackNote("busy", false, true), /another tab/);
 });
 
 // --- the status -------------------------------------------------------------------------------
@@ -199,7 +221,7 @@ test("live: audio is sent in 80 ms frames, silence included, from the start of t
   assert.deepEqual(ws.texts, [{ type: "stop" }]);
   assert.equal(ws.sent.at(-1), JSON.stringify({ type: "stop" }));
   ws.hangUp();
-  assert.deepEqual(await end, { text: "", from: null, reason: null });
+  assert.deepEqual(await end, { text: "", from: null, exact: true, reason: null });
 });
 
 test("live: words show as they come; stop waits for the close and keeps the last unfinished update as that turn's text", async () => {
@@ -218,7 +240,7 @@ test("live: words show as they come; stop waits for the close and keeps the last
   await Promise.resolve();
   assert.equal(done, false, "the text isn't final until the socket closes");
   ws.hangUp();
-  assert.deepEqual(await end, { text: "New idea. Water the tomatoes every morning", from: null, reason: null });
+  assert.deepEqual(await end, { text: "New idea. Water the tomatoes every morning", from: null, exact: true, reason: null });
   assert.deepEqual(seen.fallbacks, []);
 });
 
@@ -238,11 +260,12 @@ test("live: a fallback in the middle keeps the text so far, stops sending, and t
   const sent = ws.frames.length;
   live.push(tone(2));
   assert.equal(ws.frames.length, sent, "no audio after the fallback");
-  assert.deepEqual(await live.finish(), { text: "Water the tomatoes. And call the", from: 3.2, reason: "visitor-limit" });
+  assert.deepEqual(await live.finish(), { text: "Water the tomatoes. And call the", from: 3.2, exact: true, reason: "visitor-limit" });
 });
 
-test("live: the in-browser model starts no later than the last words that came, so nothing said after them is lost", async () => {
-  // The server took 3 s, but its last words came at 2 s of audio: whatever was said after them is unheard.
+test("live: when the server took more audio than its last words cover, the in-browser model starts a margin before them", async () => {
+  // The server took 3 s, but its last words came at 2 s of audio: whatever was said after them may be unheard,
+  // and 2 s may be the middle of a word, so the model starts a margin earlier and joinText drops what both heard.
   const { ws, live } = session();
   ws.open();
   live.push(tone(2));
@@ -250,7 +273,18 @@ test("live: the in-browser model starts no later than the last words that came, 
   live.push(tone(1));
   ws.say({ type: "fallback", reason: "error", seconds: 3 });
   ws.hangUp();
-  assert.deepEqual(await live.finish(), { text: "Water the", from: 2, reason: "error" });
+  assert.deepEqual(await live.finish(), { text: "Water the", from: 2 - LAG_MARGIN, exact: false, reason: "error" });
+});
+
+test("live: a fallback whose seconds the last words cover starts exactly there", async () => {
+  // Flux's last words for the audio came while the server drained it, just before the fallback.
+  const { ws, live } = session();
+  ws.open();
+  live.push(tone(1.4));
+  ws.say({ type: "update", turn: 0, text: "The soup was very" });
+  ws.say({ type: "fallback", reason: "error", seconds: 1.3 });
+  ws.hangUp();
+  assert.deepEqual(await live.finish(), { text: "The soup was very", from: 1.3, exact: true, reason: "error" });
 });
 
 for (const reason of ["cap", "visitor-limit", "busy", "session-limit", "idle", "error"] as const) {
@@ -262,7 +296,7 @@ for (const reason of ["cap", "visitor-limit", "busy", "session-limit", "idle", "
     ws.hangUp();
     live.push(tone(1));
     assert.deepEqual(seen.fallbacks, [reason]);
-    assert.deepEqual(await live.finish(), { text: "", from: 0, reason });
+    assert.deepEqual(await live.finish(), { text: "", from: 0, exact: false, reason });
     assert.deepEqual(ws.texts, [], "no stop for a socket that has closed");
   });
 }
@@ -273,7 +307,7 @@ test("live: a socket that won't open falls back at once, with nothing sent", asy
   ws.fail();
   assert.deepEqual(seen.fallbacks, ["error"]);
   live.push(tone(1));
-  assert.deepEqual(await live.finish(), { text: "", from: 0, reason: "error" });
+  assert.deepEqual(await live.finish(), { text: "", from: 0, exact: false, reason: "error" });
   assert.equal(ws.sent.length, 0);
 });
 
@@ -287,7 +321,7 @@ test("live: a socket that doesn't open in time is given up on, and closed", asyn
   assert.ok(ws.closedBy !== null);
   ws.open(); // too late
   assert.equal(ws.sent.length, 0);
-  assert.deepEqual(await live.finish(), { text: "", from: 0, reason: "error" });
+  assert.deepEqual(await live.finish(), { text: "", from: 0, exact: false, reason: "error" });
 });
 
 test("live: stop before the socket opens still sends everything, then stop", async () => {
@@ -299,7 +333,7 @@ test("live: stop before the socket opens still sends everything, then stop", asy
   assert.deepEqual(ws.texts, [{ type: "stop" }]);
   ws.say({ type: "end-of-turn", turn: 0, text: "Hi." });
   ws.hangUp();
-  assert.deepEqual(await end, { text: "Hi.", from: null, reason: null });
+  assert.deepEqual(await end, { text: "Hi.", from: null, exact: true, reason: null });
 });
 
 test("live: the connection dropping mid-recording keeps the text, and the in-browser model takes over a margin before the last words came", async () => {
@@ -314,7 +348,7 @@ test("live: the connection dropping mid-recording keeps the text, and the in-bro
   live.push(tone(1));
   ws.hangUp();
   assert.deepEqual(seen.fallbacks, ["error"]);
-  assert.deepEqual(await live.finish(), { text: "Water the", from: 2.5 - LAG_MARGIN, reason: "error" });
+  assert.deepEqual(await live.finish(), { text: "Water the", from: 2.5 - LAG_MARGIN, exact: false, reason: "error" });
 });
 
 test("live: a drop soon after the start gives the in-browser model all of the recording", async () => {
@@ -324,7 +358,7 @@ test("live: a drop soon after the start gives the in-browser model all of the re
   ws.say({ type: "update", turn: 0, text: "New" });
   live.push(tone(1));
   ws.fail();
-  assert.deepEqual(await live.finish(), { text: "New", from: 0, reason: "error" });
+  assert.deepEqual(await live.finish(), { text: "New", from: 0, exact: false, reason: "error" });
 });
 
 test("live: a fallback that doesn't say how much the server took starts a margin before the last words, not from the start", async () => {
@@ -337,7 +371,7 @@ test("live: a fallback that doesn't say how much the server took starts a margin
   live.push(tone(1));
   ws.say({ type: "fallback", reason: "idle" });
   ws.hangUp();
-  assert.deepEqual(await live.finish(), { text: "New idea. Water the tomatoes", from: 3 - LAG_MARGIN, reason: "idle" });
+  assert.deepEqual(await live.finish(), { text: "New idea. Water the tomatoes", from: 3 - LAG_MARGIN, exact: false, reason: "idle" });
 });
 
 test("live: whether any audio went to the server", async () => {
@@ -381,7 +415,7 @@ test("live: no close after stop in time: the text so far is kept, and the in-bro
   const end = live.finish();
   mock.timers.tick(STOP_WAIT_MS);
   assert.ok(ws.closedBy !== null);
-  assert.deepEqual(await end, { text: "Water the tomatoes", from: 2 - LAG_MARGIN, reason: "error" });
+  assert.deepEqual(await end, { text: "Water the tomatoes", from: 2 - LAG_MARGIN, exact: false, reason: "error" });
 });
 
 test("live: a send that throws (the socket closing under it) is a fallback, not an exception", async () => {
@@ -391,7 +425,7 @@ test("live: a send that throws (the socket closing under it) is a fallback, not 
   ws.send = () => { throw new Error("closed"); };
   live.push(tone(0.5));
   assert.deepEqual(seen.fallbacks, ["error"]);
-  assert.deepEqual(await live.finish(), { text: "", from: 0, reason: "error" });
+  assert.deepEqual(await live.finish(), { text: "", from: 0, exact: false, reason: "error" });
 });
 
 test("live: finish twice gives the same answer", async () => {
@@ -409,5 +443,5 @@ test("live: a socket the browser refuses to make (a policy, say) falls back, jus
   live.push(tone(0.5));
   await Promise.resolve();
   assert.deepEqual(fallbacks, ["error"]);
-  assert.deepEqual(await live.finish(), { text: "", from: 0, reason: "error" });
+  assert.deepEqual(await live.finish(), { text: "", from: 0, exact: false, reason: "error" });
 });

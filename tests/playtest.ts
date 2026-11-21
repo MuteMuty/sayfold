@@ -20,6 +20,9 @@
 //   EOF
 //   )"
 //   afconvert -f WAVE -d LEI16@16000 -c 1 long-idea.aiff tests/fixtures/long-idea.wav
+// A clip with words said twice (lab#109), tests/fixtures/soup.wav, its first pause from 0.96 s to 1.64 s:
+//   say -v Samantha -r 170 -o soup.aiff "The soup was very [[slnc 700]] very good, and then I said no [[slnc 700]] no, thank you."
+//   afconvert -f WAVE -d LEI16@16000 -c 1 soup.aiff tests/fixtures/soup.wav
 // It always plays through the in-page stand-in, with a room's steady noise mixed in (LONG_SNR), as a phone
 // on a table hears it: the pauses then aren't digital silence, which is what made the speech model stop early.
 // First choice is Chromium's own fake capture device (--use-fake-device-for-media-stream with
@@ -72,6 +75,7 @@ const LIST_SECONDS = LIST_WAV.readUInt32LE(LIST_WAV.indexOf("data") + 4) / 32000
 const LONG = readFileSync(join(repo, "tests/fixtures/long-idea.wav"));
 const LONG_B64 = LONG.toString("base64");
 /** Its length: the data chunk's bytes, at 16 kHz in 16 bits. */
+const SOUP_B64 = readFileSync(join(repo, "tests/fixtures/soup.wav")).toString("base64");
 const LONG_SECONDS = LONG.readUInt32LE(LONG.indexOf("data") + 4) / 32000;
 /** Speech to room noise, in dB, for the long recording. */
 const LONG_SNR = 10;
@@ -277,7 +281,7 @@ type LiveMode = {
   status: "available" | "unavailable" | 500 | "down";
   /** The socket: scripted words; "none": not answered, so it fails to open; refused at once; or a fallback in the
    *  clip's pause after "morning,", once the words before it have come. */
-  socket: "ok" | "none" | { refuse: Reason } | { pause: Reason } | { drop: "no-close-frame" | Reason };
+  socket: "ok" | "none" | { refuse: Reason } | { pause: Reason } | { drop: "no-close-frame" | Reason } | { cut: Reason; at: number; text: string };
   steps: Step[];
   last: Step | null;
 };
@@ -336,6 +340,14 @@ async function mockLive(ctx, initial: Partial<LiveMode> = {}) {
         // No close frame (as a dropped connection is seen in the browser), or a fallback that doesn't say how much was taken.
         if (sock.drop === "no-close-frame") return ws.close({ code: 1006, reason: "" });
         say({ type: "fallback", reason: sock.drop });
+        return ws.close({ code: 1000, reason: "fallback" });
+      }
+      // Once a little past `at`: the last words, drained, then a fallback that took `at` seconds.
+      if (typeof sock === "object" && "cut" in sock && seconds >= sock.at + 0.1) {
+        ended = true;
+        conn.fellBackAt = sock.at;
+        say({ type: "update", turn: 0, text: sock.text });
+        say({ type: "fallback", reason: sock.cut, seconds: sock.at });
         return ws.close({ code: 1000, reason: "fallback" });
       }
       if (typeof sock === "object" && "pause" in sock) {
@@ -858,6 +870,7 @@ await check("live fallback, part way", async () => {
   const seconds = await page.evaluate(() => window.__sayfold.seconds());
   assert.equal(st.reason, "visitor-limit");
   assert.ok(Math.abs(st.from - at) < 1e-6, `the in-browser model took over at ${st.from} s, not where the server stopped (${at} s)`);
+  assert.equal(st.exact, true, "the in-browser model's start, at the server's cut, isn't exact");
   assert.ok(Math.abs(st.localSeconds - (seconds - at)) < 0.01, `the in-browser model got ${st.localSeconds} s, not the ${(seconds - at).toFixed(2)} s after the fallback`);
   assert.ok(at > 2.3 && at < 3, `the stand-in fell back at ${at} s, outside the pause`);
   assert.ok(text.startsWith("New idea. Water the tomatoes every morning, and "), `the text so far wasn't kept, or isn't joined mid-sentence: "${text}"`);
@@ -887,6 +900,33 @@ await check("live fallback, part way", async () => {
   await ctx.close();
 });
 
+// --- a fallback that says how much it took, where a word is said twice: the in-browser model keeps both -----------
+await check("live fallback, a word said twice", async () => {
+  const { ctx, page, server } = await openPage("live fallback, a word said twice", { viewport: { width: 1280, height: 900 }, colorScheme: "light" }, {
+    mic: { b64: SOUP_B64 },
+    // The server's cut is in the pause after the first "very" (0.96 s to 1.64 s).
+    live: { status: "available", socket: { cut: "error", at: 1.3, text: "The soup was very" }, steps: [{ at: 0.6, type: "update", turn: 0, text: "The soup" }] },
+  });
+  await page.waitForFunction(() => window.__sayfold.live().on === true, null, { timeout: 5000 });
+  await page.locator("#rec").click();
+  await waitState(page, ["recording"], 10000);
+  await page.waitForSelector("#live-note:not([hidden])", { timeout: 8000 });
+  assert.equal(await page.textContent("#live-text"), "The soup was very");
+  await page.waitForTimeout(6500 - 1500);
+  await page.locator("#rec").click();
+  await waitState(page, ["review", "problem"], 180000);
+  assert.equal(await state(page), "review", await page.textContent("#problem-title"));
+  const text = await page.inputValue("#text");
+  const st = await liveState(page);
+  assert.equal(st.exact, true, "a fallback with seconds its words cover isn't an exact start");
+  assert.ok(Math.abs(st.from - server.connections[0].fellBackAt!) < 1e-6, `the in-browser model took over at ${st.from} s, not the server's 1.3 s`);
+  const words = wordsOf(text);
+  assert.deepEqual(words.slice(0, 6), ["the", "soup", "was", "very", "very", "good"], `"${text}"`);
+  assert.equal(words.filter((w) => w === "no").length, 2, `"${text}"`);
+  console.log(`live fallback, a word said twice: "${text}" (the in-browser model from ${st.from} s)`);
+  await ctx.close();
+});
+
 // --- live text whose words lag the audio, then stop without saying how much was heard: every word, once -----------
 for (const drop of ["no-close-frame", "idle"] as const) {
   const label = `live drop, ${drop === "no-close-frame" ? "no close frame" : "fallback without seconds"}`;
@@ -907,6 +947,7 @@ for (const drop of ["no-close-frame", "idle"] as const) {
     const st = await liveState(page);
     assert.equal(st.reason, drop === "idle" ? "idle" : "error");
     const at = server.connections[0].fellBackAt!;
+    assert.equal(st.exact, false, "a drop is taken as an exact start");
     assert.ok(st.from > 0.5 && st.from < at - 0.4, `the in-browser model took over at ${st.from} s, too close to the last words' ${at.toFixed(2)} s`);
     assert.ok(text.startsWith("New idea. Water the tomatoes every morning, and "), `"${text}"`);
     // Every word said, exactly once, in order.
@@ -944,7 +985,8 @@ await check("live fallback, every reason", async () => {
     if (reason) {
       await page.waitForSelector("#live-note:not([hidden])", { timeout: 8000 });
       const note = await page.textContent("#live-note");
-      assert.match(note, /, so it's turned into text on this device\.$/, `${label}: ${note}`);
+      // Audio may have gone before the refusal: then it's never said as if none had.
+      assert.match(note, /, so it's turned into text on this device(, from the start)?\.$/, `${label}: ${note}`);
       if (reason === "busy") await shot(page, "phone-recording-live-busy-light");
     } else assert.equal(await page.isVisible("#live"), false, `${label}: live text shows though it's off`);
     await page.waitForTimeout(5500);
