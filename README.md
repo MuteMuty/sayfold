@@ -1,6 +1,6 @@
 # Sayfold
 
-**Say an idea, get it as text, send it to your repo.** Press record, say it, review it as text you can edit, and send it to your own GitHub repo as an issue. The speech is turned into text in your browser, so your voice never leaves your device, and the text goes straight from your browser to GitHub with your own token. Sayfold has no server.
+**Say an idea, get it as text, send it to your repo.** Press record, say it, review it as text you can edit, and send it to your own GitHub repo as an issue. The speech is turned into text in your browser, so your voice never leaves your device, and the text goes straight from your browser to GitHub with your own token.
 
 It's a voice-to-idea inbox (lab#80): GitHub is the API, so the issues are there for you, or for agents, to pick up.
 
@@ -45,7 +45,7 @@ A short clip is one part, asked once, as before.
 ## Privacy
 
 - Your recording never leaves your device: it lives only in this tab's memory and is gone when you leave the page. So does the text, until you press **Send to GitHub**.
-- **Where the text goes:** only to your own GitHub repo, straight from your browser to GitHub's API (`api.github.com`), when you press Send. Sayfold has no server, and nothing you say or type is stored or sent anywhere else.
+- **Where the text goes:** only to your own GitHub repo, straight from your browser to GitHub's API (`api.github.com`), when you press Send. Nothing you say or type is stored or sent anywhere else.
 - **Where the token goes:** only to `api.github.com`, in the `Authorization` header of those requests. It's kept in this tab's memory, gone when you close it, unless you tick **Remember on this device**: then it's kept in this browser's localStorage (`sayfold:github`, with the repo's name) until you press **Forget token**, which clears it from memory and storage in one click. Use a fine-grained token limited to the one repo, with Issues as its only permission.
 - The page's Content-Security-Policy lets it reach only its own address, `https://api.github.com`, and the lab hub's like counter and analytics (`https://lab.brightloopapps.com`, `https://eu.i.posthog.com`). The browser refuses anything else, so the token and the text have nowhere else to go.
 - Every file the page needs (the page, the speech model, the speech runtime) comes from Sayfold's own address. The speech library is set up so it never contacts Hugging Face or a CDN.
@@ -74,10 +74,21 @@ The speech runtime is [transformers.js](https://github.com/huggingface/transform
 | `src/audio/` | `recorder.ts` (the microphone through an AudioWorklet, plus an AnalyserNode for the waveform) and `capture.worklet.ts` (hands raw samples to the page). |
 | `src/stt/` | `worker.ts` (the Web Worker: picks WebGPU or the CPU, loads the model on first use, transcribes), `store.ts` (downloads the model once, checks it and keeps it in cache storage), `config.ts` (keeps the library on Sayfold's own origin), `ort.ts` (the onnxruntime build), `client.ts` (the page's side of the worker). |
 | `src/analytics*.ts` | The usage events and their allow-list: `$pageview`, `play_started` when a recording starts, `play_finished` when its transcript is ready, with only `seconds_bucket` and `backend`, and `idea_sent`, with no properties. |
+| `src/server/`, `src/listen/protocol.ts` | The Worker and its live-dictation endpoint, which the page doesn't use yet (see [The Worker](#the-worker)). |
 | `src/csp.ts` | The Content-Security-Policy, which `vite.config.ts` puts in the built page as a `<meta>` tag (the dev server goes without it). |
 | `index.html`, `src/style.css` | One page, light and dark from the system, no web fonts. The GitHub setup is a native `<dialog>`, and the labels are real checkboxes. |
 
 The page's own code is about 12 KB of JavaScript gzipped. The speech code (about 600 KB before compression, mostly transformers.js) loads only with the first recording.
+
+## The Worker
+
+Sayfold is a Cloudflare Worker (`src/server/index.ts`). It serves the page's files from `dist/` exactly as before, and has a WebSocket endpoint for live dictation (lab#109). **The page doesn't use it yet**: it still turns speech into text in the browser, and sends nothing to the Worker.
+
+- **`/api/listen`** (WebSocket, `GET` only). The page sends 16 kHz, 16-bit mono audio. The Worker passes it to Workers AI's Deepgram Flux model (`@cf/deepgram/flux`, with the project names as keyterms) and sends back each turn's running text and its end, in the small protocol in `src/listen/protocol.ts`. Every request opts out of Deepgram's Model Improvement Program (`mip_opt_out`), so what a visitor says isn't used for training. It takes only pages on Sayfold's own addresses and localhost.
+- **`/api/listen/status`** says whether the page may use it now: `{ "available": true }` or `false`.
+- **Limits** (`src/server/config.ts`): one recording at a time and 3 minutes a day per visitor, 2 minutes per recording, and the whole site stops at an estimated 9,000 neurons a day, before Workers AI's free 10,000. A recording counts its seconds of audio or of time connected, whichever is more, and one that sends no audio for 10 seconds is closed. Workers AI's free allowance is shared by the whole account, so if it refuses because the day's allowance is used up (error 3036), Sayfold stops asking it until midnight UTC. Then, or if Workers AI fails, the page gets a `fallback` message and the socket closes, so the page can use the in-browser model. The cap resets at midnight UTC.
+- **What it keeps:** one Durable Object (`src/server/meter.ts`, SQLite) holds the day's neuron estimate, each visitor's seconds, the recordings open right now, and the day's random salt. A visitor is known only by an HMAC-SHA-256 of their IP address and the date under that salt. An alarm at midnight UTC deletes earlier days' salts and counts, even when nobody has used it. Audio and text pass through memory only: they're never stored or logged, and Workers Logs is off.
+- **Tests** mock the AI binding and never call Workers AI, whose free allowance the whole account shares. They run the counter on a real SQLite database, and check that recognisable audio and text never reach storage, a log or another request.
 
 ## Run it
 
@@ -85,7 +96,7 @@ The page's own code is about 12 KB of JavaScript gzipped. The speech code (about
 # needs Node 22.18 or newer (the tests run TypeScript directly)
 npm install
 npm run dev                         # local dev server
-npm test                            # unit tests (node --test)
+npm test                            # unit tests (node --test), Workers AI mocked
 npm run build                       # typecheck, then build to dist/
 ```
 

@@ -4,9 +4,9 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "typecheck": "tsc -p . --noEmit && tsc -p tests",
+    "typecheck": "tsc -p . --noEmit && tsc -p src/server && tsc -p tests",
     "test": "tsc -p tests && node --test \"tests/unit/*.test.ts\"",
-    "build": "tsc -p . --noEmit && vite build",
+    "build": "tsc -p . --noEmit && tsc -p src/server && vite build",
     "preview": "vite preview",
     "playtest": "node tests/playtest.ts"
   },
@@ -14,6 +14,7 @@
     "@huggingface/transformers": "4.3.2"
   },
   "devDependencies": {
+    "@cloudflare/workers-types": "5.20261110.1",
     "@types/node": "^22.15.0",
     "playwright": "^1.52.0",
     "typescript": "5.8.3",

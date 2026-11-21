@@ -10,5 +10,5 @@
     "playtest": "node tests/playtest.ts",
     "deploy": "npx wrangler deploy"
   },
-  "smoke": ["/"]
+  "smoke": ["/", "/api/listen/status"]
 }

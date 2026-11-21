@@ -1,9 +1,25 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "sayfold",
+  // The page's files come straight from dist/; the Worker answers only what isn't a file (/api/listen).
+  "main": "src/server/index.ts",
   "compatibility_date": "2026-11-01",
   "workers_dev": true,
   "assets": {
-    "directory": "./dist"
+    "directory": "./dist",
+    "binding": "ASSETS"
+  },
+  // Workers AI, for Flux (src/server/config.ts). The account's free allowance is the hard limit.
+  "ai": {
+    "binding": "AI"
+  },
+  // The day's counter: one SQLite-backed Durable Object (free plan).
+  "durable_objects": {
+    "bindings": [{ "name": "METER", "class_name": "Meter" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Meter"] }],
+  // No Workers Logs: nothing a visitor says may end up in a log.
+  "observability": {
+    "enabled": false
   }
 }
