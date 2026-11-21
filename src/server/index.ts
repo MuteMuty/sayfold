@@ -3,7 +3,7 @@
 // Durable Object (src/server/meter.ts). Type-checked with the Workers types (src/server/tsconfig.json).
 import { DurableObject } from "cloudflare:workers";
 import { handle, type MeterApi, type Socket, type SpeechAi } from "./listen.ts";
-import { MeterCore } from "./meter.ts";
+import { MeterCore, sweepAndSchedule } from "./meter.ts";
 
 interface Env {
   AI: Ai;
@@ -18,6 +18,12 @@ export class Meter extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.#core = new MeterCore(ctx.storage.sql);
+    // Earlier days' salts and counts go at midnight UTC even when nobody records: the alarm, set here on
+    // the first start and again each time it runs, deletes them and sets the next one.
+    void ctx.blockConcurrencyWhile(() => sweepAndSchedule(this.#core, ctx.storage));
+  }
+  alarm() {
+    return sweepAndSchedule(this.#core, this.ctx.storage);
   }
   status(ip: string) {
     return this.#core.status(ip);
@@ -30,6 +36,9 @@ export class Meter extends DurableObject<Env> {
   }
   close(session: string) {
     this.#core.close(session);
+  }
+  exhausted() {
+    this.#core.exhausted();
   }
 }
 

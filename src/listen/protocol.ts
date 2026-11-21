@@ -3,6 +3,14 @@
 // (little-endian), and sends { type: "stop" } when the speaker is done. The Worker answers with the
 // running text. A "fallback" message means the server can't take this recording (or the rest of it):
 // the socket then closes cleanly and the page carries on with the in-browser model.
+//
+// For the page (lab#109, slice 2):
+// - The socket closing is the end of the stream, not `end-of-turn`. After `stop`, Flux may not finish its
+//   last turn, so its words may arrive only as an `update`: when the socket closes, keep the latest
+//   `update` of any turn that didn't end as that turn's text.
+// - A `fallback` can come in the middle of a turn. Keep the text received so far (the ended turns and the
+//   latest `update`), and transcribe what comes after it with the in-browser model.
+// - Send audio continuously, silence included: a socket with no audio for a few seconds is closed (`idle`).
 
 export const LISTEN_PATH = "/api/listen";
 /** GET: a ListenStatus, so the page can pick the server or the in-browser model before it records. */
@@ -18,13 +26,16 @@ export interface ListenStatus {
 
 /**
  * Why the server stopped or refused:
- * - `cap`: the day's speech allowance is used up (it comes back at midnight UTC);
+ * - `cap`: the day's speech allowance is used up, or the speech service said so (it comes back at midnight UTC);
  * - `visitor-limit`: this visitor's minutes for the day are used up;
  * - `busy`: this visitor already has a recording open;
  * - `session-limit`: the recording reached the longest one the server takes;
+ * - `idle`: no audio came for a while (the page stopped sending);
  * - `error`: the speech service failed or refused.
+ *
+ * The day's allowance and the visitor's minutes count time connected as well as audio.
  */
-export type FallbackReason = "cap" | "visitor-limit" | "busy" | "session-limit" | "error";
+export type FallbackReason = "cap" | "visitor-limit" | "busy" | "session-limit" | "idle" | "error";
 
 export type ClientMessage = { type: "stop" };
 

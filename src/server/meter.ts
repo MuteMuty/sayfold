@@ -1,7 +1,8 @@
 // The live-dictation counter, kept by one SQLite-backed Durable Object (src/server/index.ts): the day's
-// estimated neurons, each visitor's seconds of audio and the recordings open right now. A visitor is
-// known only by an HMAC-SHA-256 of their IP address and the day, under a random salt made for that UTC
-// day. Earlier days' salts and counts are deleted. No audio, text or IP address is ever stored here.
+// estimated neurons, each visitor's seconds (of audio or time connected) and the recordings open right now.
+// A visitor is known only by an HMAC-SHA-256 of their IP address and the day, under a random salt made for
+// that UTC day. Earlier days' salts and counts are deleted at midnight UTC by the Durable Object's alarm
+// (sweepAndSchedule), with or without traffic. No audio, text or IP address is ever stored here.
 import type { FallbackReason, ListenStatus } from "../listen/protocol.ts";
 import {
   DAILY_NEURON_CAP, NEURONS_PER_AUDIO_SECOND, SESSION_MAX_SECONDS, STALE_SESSION_MS, VISITOR_OPEN_SESSIONS, VISITOR_SECONDS_PER_DAY,
@@ -20,6 +21,17 @@ export type Opened =
 export type Added = { ok: true } | { ok: false; reason: Extract<FallbackReason, "cap" | "visitor-limit" | "error"> };
 
 export const utcDay = (ms: number): string => new Date(ms).toISOString().slice(0, 10);
+
+/** The start of the UTC day after the one `ms` is in. */
+export function nextUtcMidnight(ms: number): number {
+  const d = new Date(ms);
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1);
+}
+
+/** What the Durable Object's alarm runs, and what it runs when it starts: delete earlier days, set the next alarm. */
+export async function sweepAndSchedule(core: MeterCore, storage: { setAlarm(ms: number): Promise<void> | void }): Promise<void> {
+  await storage.setAlarm(core.sweep());
+}
 
 const hex = (bytes: ArrayBuffer | Uint8Array): string =>
   Array.from(new Uint8Array(bytes), (b) => b.toString(16).padStart(2, "0")).join("");
@@ -63,7 +75,7 @@ export class MeterCore {
     return { ok: true, session, seconds: Math.min(SESSION_MAX_SECONDS, left) };
   }
 
-  /** Counts `seconds` of audio a recording streamed, and says whether it may go on. */
+  /** Counts `seconds` a recording streamed (audio or time connected), and says whether it may go on. */
   add(session: string, seconds: number): Added {
     const day = this.today();
     const row = this.sql.exec("SELECT visitor FROM sessions WHERE id = ?", session).toArray()[0];
@@ -87,14 +99,36 @@ export class MeterCore {
     this.sql.exec("DELETE FROM sessions WHERE id = ?", session);
   }
 
+  /**
+   * Workers AI refused because the account's free allowance for the day is used up (by any project on the
+   * account): the rest of the UTC day is closed, as at the cap, so nothing asks it again until midnight.
+   */
+  exhausted(): void {
+    this.sql.exec(
+      "INSERT INTO days (day, neurons) VALUES (?, ?) ON CONFLICT (day) DO UPDATE SET neurons = MAX(neurons, excluded.neurons)",
+      this.today(), DAILY_NEURON_CAP,
+    );
+  }
+
+  /** Deletes every earlier day's salt and counts, and recordings gone stale; returns when to do it next. */
+  sweep(): number {
+    const now = this.now();
+    this.forgetBefore(utcDay(now));
+    this.sql.exec("DELETE FROM sessions WHERE seen < ?", now - STALE_SESSION_MS);
+    return nextUtcMidnight(now);
+  }
+
   /** Today's date in UTC, after deleting every earlier day's salt and counts. */
   private today(): string {
     const day = utcDay(this.now());
-    if (day !== this.day) {
-      for (const table of ["salts", "days", "visitors"]) this.sql.exec(`DELETE FROM ${table} WHERE day <> ?`, day);
-      this.day = day;
-    }
+    if (day !== this.day) this.forgetBefore(day);
     return day;
+  }
+
+  private forgetBefore(day: string): void {
+    for (const table of ["salts", "days", "visitors"]) this.sql.exec(`DELETE FROM ${table} WHERE day <> ?`, day);
+    if (this.key?.day !== day) this.key = null;
+    this.day = day;
   }
 
   private neurons(day: string): number {

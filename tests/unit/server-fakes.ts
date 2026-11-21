@@ -72,18 +72,29 @@ interface AiCall {
   upstream: FakeSocket;
 }
 
-/** A mocked AI binding: each run opens a fake Flux socket, or fails as told. */
-export function fakeAi(behaviour: "ok" | "throws" | "no-socket" = "ok") {
+/** What the AI binding throws, as Workers AI's errors page words them (Cloudflare docs, 21 Nov 2026). */
+export const AI_ERRORS = {
+  /** The account's daily free allocation is used up, by any of its projects. */
+  quota: "AiError: 3036: You have used up your daily free allocation of 10,000 neurons. Please upgrade to Cloudflare's Workers Paid plan if you would like to continue usage.",
+  /** Busy for a moment: not the day's allowance. */
+  capacity: "AiError: 3040: Capacity temporarily exceeded, please try again.",
+  throws: "AiError: 5007: No such model @cf/deepgram/flux or task",
+};
+
+/** A mocked AI binding: each run opens a fake Flux socket, or fails as told. `runs` counts every attempt. */
+export function fakeAi(behaviour: "ok" | "no-socket" | keyof typeof AI_ERRORS = "ok") {
   const calls: AiCall[] = [];
+  const runs = { count: 0 };
   const ai: SpeechAi = {
     async run(model, inputs, options) {
-      if (behaviour === "throws") throw new Error("AiError: 3036: account limit reached");
+      runs.count++;
+      if (behaviour in AI_ERRORS) throw new Error(AI_ERRORS[behaviour as keyof typeof AI_ERRORS]);
       const upstream = new FakeSocket();
       calls.push({ model, inputs: inputs as Record<string, unknown>, options: options as Record<string, unknown>, upstream });
       return { webSocket: behaviour === "no-socket" ? null : upstream };
     },
   };
-  return { ai, calls };
+  return { ai, calls, runs };
 }
 
 /** A Worker runtime around a real meter (on memorySql) and a mocked AI, with a settable clock. */
@@ -103,6 +114,7 @@ export function setup(opts: { ai?: ReturnType<typeof fakeAi>; start?: number } =
       open: async (ip) => core.open(ip),
       add: async (session, seconds) => core.add(session, seconds),
       close: async (session) => core.close(session),
+      exhausted: async () => core.exhausted(),
     },
     assets: { fetch: async (req) => (assets.push(req), new Response("asset", { status: 200 })) },
     pair() {
@@ -123,11 +135,11 @@ export function setup(opts: { ai?: ReturnType<typeof fakeAi>; start?: number } =
 
 export const ORIGIN = "https://sayfold.brightloopapps.com";
 
-export function listenRequest({ origin = ORIGIN as string | null, ip = "203.0.113.7", upgrade = "websocket" as string | null } = {}) {
+export function listenRequest({ origin = ORIGIN as string | null, ip = "203.0.113.7", upgrade = "websocket" as string | null, method = "GET" } = {}) {
   const headers = new Headers({ "cf-connecting-ip": ip });
   if (origin !== null) headers.set("origin", origin);
   if (upgrade !== null) headers.set("upgrade", upgrade);
-  return new Request("https://sayfold.brightloopapps.com/api/listen", { headers });
+  return new Request("https://sayfold.brightloopapps.com/api/listen", { headers, method });
 }
 
 /** A frame of `seconds` of audio, filled with a repeating byte pattern. */

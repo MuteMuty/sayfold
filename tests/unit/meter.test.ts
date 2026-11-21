@@ -2,7 +2,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
-import { MeterCore, utcDay } from "../../src/server/meter.ts";
+import { MeterCore, nextUtcMidnight, sweepAndSchedule, utcDay } from "../../src/server/meter.ts";
 import {
   DAILY_NEURON_CAP, NEURONS_PER_AUDIO_SECOND, SESSION_MAX_SECONDS, STALE_SESSION_MS, VISITOR_SECONDS_PER_DAY,
 } from "../../src/server/config.ts";
@@ -156,4 +156,80 @@ test("a second meter on the same storage (a restarted Durable Object) keeps the 
   assert.equal(a.ok, true);
   const again = new MeterCore(sql, () => clock.now);
   assert.deepEqual(await again.open(IP), { ok: false, reason: "busy" }, "same salt, so the same visitor");
+});
+
+test("Workers AI refusing for the day (the account's allowance, used up elsewhere) closes the rest of the UTC day", async () => {
+  const { core, clock } = meter(Date.UTC(2026, 10, 21, 23, 0, 0));
+  const open = await openOk(core, "198.51.100.1");
+  assert.deepEqual(core.add(open.session, 1), { ok: true }, "far below Sayfold's own cap");
+  core.exhausted();
+  assert.deepEqual(await core.status(IP), { available: false });
+  assert.deepEqual(await core.open(IP), { ok: false, reason: "cap" });
+  assert.deepEqual(core.add(open.session, 0), { ok: false, reason: "cap" }, "an open recording hears at its next report");
+  core.exhausted(); // twice is the same as once
+  clock.now = Date.UTC(2026, 10, 22, 0, 0, 0);
+  assert.deepEqual(await core.status(IP), { available: true }, "back at midnight UTC");
+  await openOk(core);
+});
+
+test("nextUtcMidnight: the start of the next UTC day, never the current moment", () => {
+  assert.equal(nextUtcMidnight(Date.UTC(2026, 10, 21, 12, 0, 0)), Date.UTC(2026, 10, 22));
+  assert.equal(nextUtcMidnight(Date.UTC(2026, 10, 21, 23, 59, 59, 999)), Date.UTC(2026, 10, 22));
+  assert.equal(nextUtcMidnight(Date.UTC(2026, 10, 22)), Date.UTC(2026, 10, 23));
+  assert.equal(nextUtcMidnight(Date.UTC(2026, 11, 31, 8)), Date.UTC(2027, 0, 1));
+});
+
+test("the midnight alarm: with no traffic at all, earlier days' salts and counts are deleted and the next alarm is set", async () => {
+  const { core, db, clock } = meter(Date.UTC(2026, 10, 21, 23, 50, 0));
+  const alarms: number[] = [];
+  const storage = { setAlarm: async (ms: number) => void alarms.push(ms) };
+  // The Durable Object starts: it sweeps and sets the alarm for the coming midnight.
+  await sweepAndSchedule(core, storage);
+  assert.deepEqual(alarms, [Date.UTC(2026, 10, 22)]);
+  for (let v = 0; v < 3; v++) {
+    const r = await openOk(core, `192.0.2.${v}`);
+    stream(core, r.session, 30);
+    core.close(r.session);
+  }
+  clock.now = Date.UTC(2026, 10, 21, 23, 59, 0);
+  const stuck = await openOk(core, "192.0.2.9"); // a recording whose Worker went away without closing it
+  core.add(stuck.session, 1);
+  const before = dump(db);
+  assert.equal(before.salts.length, 1);
+  assert.equal(before.days.length, 1);
+  assert.equal(before.visitors.length, 4);
+
+  // Before midnight, the alarm (if it fired early) keeps today's rows.
+  clock.now = Date.UTC(2026, 10, 21, 23, 59, 59, 999);
+  await sweepAndSchedule(core, storage);
+  assert.deepEqual(dump(db).salts, before.salts);
+
+  // The alarm at midnight UTC: nobody has asked for anything since.
+  clock.now = Date.UTC(2026, 10, 22, 0, 0, 0);
+  await sweepAndSchedule(core, storage);
+  const after = dump(db);
+  assert.deepEqual(after.salts, [], "yesterday's salt is gone, and none is made until someone comes");
+  assert.deepEqual(after.days, []);
+  assert.deepEqual(after.visitors, []);
+  assert.equal(alarms.at(-1), Date.UTC(2026, 10, 23), "and the next midnight is set");
+  assert.equal(after.sessions.length, 1, "a recording open across midnight isn't cut off");
+
+  // A recording left open at midnight goes once it's stale, at the next alarm.
+  clock.now = Date.UTC(2026, 10, 22, 0, 0, 0) + STALE_SESSION_MS;
+  await sweepAndSchedule(core, storage);
+  assert.deepEqual(dump(db).sessions, []);
+});
+
+test("the midnight alarm: the in-memory key for yesterday's salt goes with it", async () => {
+  const { core, db, clock } = meter(Date.UTC(2026, 10, 21, 23, 50, 0));
+  await openOk(core);
+  const yesterday = String(dump(db).sessions[0].visitor);
+  clock.now = Date.UTC(2026, 10, 22, 0, 0, 0);
+  await sweepAndSchedule(core, { setAlarm: () => {} });
+  // Today the same IP is someone new: a new salt, so a new hash (not yesterday's cached key).
+  const r = await openOk(core);
+  const row = dump(db).sessions.find((s) => s.id === r.session)!;
+  assert.notEqual(row.visitor, yesterday);
+  const salt = String(dump(db).salts[0].salt);
+  assert.equal(row.visitor, createHmac("sha256", Buffer.from(salt, "hex")).update(`${IP}|2026-11-22`).digest("hex"));
 });

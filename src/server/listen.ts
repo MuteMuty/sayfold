@@ -6,7 +6,10 @@ import {
   BYTES_PER_SECOND, LISTEN_PATH, SAMPLE_RATE, STATUS_PATH, parseClientMessage,
   type FallbackReason, type ListenStatus, type ServerMessage,
 } from "../listen/protocol.ts";
-import { DRAIN_MS, KEYTERMS, LOCAL_ORIGIN, MAX_FRAME_BYTES, ORIGINS, REPORT_EVERY_SECONDS, SESSION_MAX_SECONDS, SPEECH_MODEL } from "./config.ts";
+import {
+  DRAIN_MS, IDLE_SECONDS, KEYTERMS, LOCAL_ORIGIN, MAX_FRAME_BYTES, MIP_OPT_OUT, ORIGINS, QUOTA_REFUSAL, REPORT_EVERY_SECONDS,
+  SESSION_MAX_SECONDS, SPEECH_MODEL,
+} from "./config.ts";
 import type { Added, Opened } from "./meter.ts";
 
 /** The part of a Workers WebSocket used here. */
@@ -29,6 +32,7 @@ export interface MeterApi {
   open(ip: string): Promise<Opened>;
   add(session: string, seconds: number): Promise<Added>;
   close(session: string): Promise<void>;
+  exhausted(): Promise<void>;
 }
 
 /** What the Worker needs from its runtime, so the tests can stand in for it. */
@@ -66,6 +70,7 @@ async function status(request: Request, rt: Runtime): Promise<Response> {
 }
 
 async function listen(request: Request, rt: Runtime): Promise<Response> {
+  if (request.method !== "GET") return new Response(null, { status: 405, headers: { allow: "GET" } });
   if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
     return new Response("Expected a WebSocket.", { status: 426, headers: { upgrade: "websocket" } });
   }
@@ -75,6 +80,9 @@ async function listen(request: Request, rt: Runtime): Promise<Response> {
   await new Session(server, rt).start(ipOf(request));
   return rt.upgrade(client);
 }
+
+/** Whether Workers AI refused because the account's daily free allocation is used up (QUOTA_REFUSAL). */
+export const isQuotaRefusal = (error: unknown): boolean => error != null && QUOTA_REFUSAL.test(String(error));
 
 /** Flux's messages as the page's, or "error" when Flux reports one. Anything else is dropped. */
 export function fromFlux(data: unknown): ServerMessage | "error" | null {
@@ -91,7 +99,7 @@ export function fromFlux(data: unknown): ServerMessage | "error" | null {
   return { type: m.event === "EndOfTurn" ? "end-of-turn" : "update", turn: m.turn_index, text: m.transcript };
 }
 
-/** One recording: the page's socket, Flux's socket, and the audio counted between them. */
+/** One recording: the page's socket, Flux's socket, and the time counted between them. */
 class Session {
   private client: Socket;
   private rt: Runtime;
@@ -103,9 +111,15 @@ class Session {
   private budgetBytes = 0;
   private budgetReason: FallbackReason = "session-limit";
   private sentBytes = 0;
-  private unreported = 0;
+  /** When Flux was opened (null until it is), the last audio came and the session ended (Date.now()). */
+  private openedAt: number | null = null;
+  private lastAudioAt = 0;
+  private endedAt: number | null = null;
+  /** Seconds already sent to the counter. */
+  private counted = 0;
   private reports: Promise<void> = Promise.resolve();
   private timer: ReturnType<typeof setTimeout> | null = null;
+  private ticker: ReturnType<typeof setInterval> | null = null;
 
   constructor(client: Socket, rt: Runtime) {
     this.client = client;
@@ -125,10 +139,16 @@ class Session {
     if (opened.seconds < SESSION_MAX_SECONDS) this.budgetReason = "visitor-limit";
 
     try {
-      const res = await this.rt.ai.run(SPEECH_MODEL, { encoding: "linear16", sample_rate: String(SAMPLE_RATE), keyterm: KEYTERMS }, { websocket: true });
+      const inputs = { encoding: "linear16", sample_rate: String(SAMPLE_RATE), keyterm: KEYTERMS, mip_opt_out: String(MIP_OPT_OUT) };
+      const res = await this.rt.ai.run(SPEECH_MODEL, inputs, { websocket: true });
       this.flux = res.webSocket ?? null;
-    } catch {
-      // Workers AI refused or failed (a retired model, the account's allowance): the page falls back.
+    } catch (error) {
+      // Workers AI refused or failed (a retired model, a busy moment): this recording falls back. When it's
+      // the account's allowance for the day, the rest of the day does, without asking Workers AI again.
+      if (isQuotaRefusal(error)) {
+        await this.rt.meter.exhausted().catch(() => {});
+        return this.end("cap");
+      }
     }
     if (!this.flux) return this.end("error");
     const flux = this.flux;
@@ -140,7 +160,23 @@ class Session {
     this.client.addEventListener("close", () => this.end());
     this.client.addEventListener("error", () => this.end());
     this.state = "open";
-    this.timer = setTimeout(() => this.finish("session-limit"), SESSION_MAX_SECONDS * 1000);
+    this.openedAt = this.lastAudioAt = Date.now();
+    // Time connected counts as audio does, so the session also ends when its seconds run out, audio or not.
+    this.timer = setTimeout(() => this.finish(this.budgetReason), opened.seconds * 1000);
+    this.ticker = setInterval(() => this.tick(), REPORT_EVERY_SECONDS * 1000);
+  }
+
+  /** The seconds this recording has used: its audio, or its time connected, whichever is more. */
+  private used(): number {
+    const connected = this.openedAt === null ? 0 : ((this.endedAt ?? Date.now()) - this.openedAt) / 1000;
+    return Math.max(this.sentBytes / BYTES_PER_SECOND, connected);
+  }
+
+  /** Every second: close a recording that has gone quiet, and report the time connected. */
+  private tick(): void {
+    if (this.state !== "open") return;
+    if (Date.now() - this.lastAudioAt >= IDLE_SECONDS * 1000) return this.finish("idle");
+    this.count();
   }
 
   private fromClient(data: unknown): void {
@@ -152,15 +188,18 @@ class Session {
     const bytes = data instanceof ArrayBuffer ? new Uint8Array(data) : ArrayBuffer.isView(data) ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength) : null;
     if (!bytes) return;
     if (bytes.length > MAX_FRAME_BYTES) return this.end(null, 1009, "frame too big");
+    // Whole 16-bit samples only: an odd last byte is dropped, never sent on or split across frames.
     const room = this.budgetBytes - this.sentBytes;
-    const frame = bytes.length <= room ? bytes : bytes.subarray(0, room);
+    const length = Math.min(bytes.length, room) & ~1;
+    if (length === 0) return; // An empty frame isn't audio.
     try {
-      this.flux!.send(frame);
+      this.flux!.send(length === bytes.length ? bytes : bytes.subarray(0, length));
     } catch {
       return this.end("error");
     }
-    this.sentBytes += frame.length;
-    this.count(frame.length / BYTES_PER_SECOND);
+    this.sentBytes += length;
+    this.lastAudioAt = Date.now();
+    this.count();
     if (this.sentBytes >= this.budgetBytes) this.finish(this.budgetReason);
   }
 
@@ -176,16 +215,15 @@ class Session {
     }
   }
 
-  /** Adds audio to the counter, a second at a time, and stops the session when the counter says so. */
-  private count(seconds: number): void {
-    this.unreported += seconds;
-    if (this.unreported >= REPORT_EVERY_SECONDS) this.report();
+  /** Reports to the counter a second at a time, and stops the session when the counter says so. */
+  private count(): void {
+    if (this.used() - this.counted >= REPORT_EVERY_SECONDS) this.report();
   }
 
   private report(): Promise<void> {
+    const seconds = this.used() - this.counted;
+    this.counted += seconds;
     this.reports = this.reports.then(async () => {
-      const seconds = this.unreported;
-      this.unreported = 0;
       if (seconds <= 0) return;
       let added: Added;
       try {
@@ -216,7 +254,9 @@ class Session {
   private end(reason: FallbackReason | null = this.reason, code = 1000, why = reason ? "fallback" : "done"): void {
     if (this.state === "closed") return;
     this.state = "closed";
+    this.endedAt = Date.now();
     if (this.timer !== null) clearTimeout(this.timer);
+    if (this.ticker !== null) clearInterval(this.ticker);
     try {
       if (reason) this.client.send(JSON.stringify({ type: "fallback", reason } satisfies ServerMessage));
       this.client.close(code, why);

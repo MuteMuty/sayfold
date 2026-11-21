@@ -2,15 +2,18 @@
 // reaches Workers AI, whose free allowance the whole account shares.
 import { afterEach, beforeEach, mock, test } from "node:test";
 import assert from "node:assert/strict";
-import { handle } from "../../src/server/listen.ts";
-import { DRAIN_MS, KEYTERMS, MAX_FRAME_BYTES, NEURONS_PER_AUDIO_SECOND, SESSION_MAX_SECONDS, SPEECH_MODEL } from "../../src/server/config.ts";
+import { handle, isQuotaRefusal } from "../../src/server/listen.ts";
+import {
+  DRAIN_MS, IDLE_SECONDS, KEYTERMS, MAX_FRAME_BYTES, MIP_OPT_OUT, NEURONS_PER_AUDIO_SECOND, SESSION_MAX_SECONDS, SPEECH_MODEL, VISITOR_SECONDS_PER_DAY,
+} from "../../src/server/config.ts";
 import { BYTES_PER_SECOND, LISTEN_PATH, STATUS_PATH, parseClientMessage } from "../../src/listen/protocol.ts";
-import { audio, fakeAi, flux, listenRequest, setup, type FakeSocket } from "./server-fakes.ts";
+import { AI_ERRORS, audio, fakeAi, flux, listenRequest, setup, type FakeSocket } from "./server-fakes.ts";
 
 const STOP = JSON.stringify({ type: "stop" });
 
-// A session's timers (its 2-minute limit, the wait for Flux's last words) run on a fake clock.
-beforeEach(() => mock.timers.enable({ apis: ["setTimeout"] }));
+// A session's timers (its 2-minute limit, the idle timeout, the wait for Flux's last words) and the time it
+// has been connected run on a fake clock.
+beforeEach(() => mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: Date.UTC(2026, 10, 21, 12, 0, 0) }));
 afterEach(() => mock.timers.reset());
 
 /** Opens a session and returns the Worker's end of the client socket and the Flux socket. */
@@ -98,7 +101,7 @@ test("session: opens Flux with the configured model and keyterms, and relays aud
   const { server, upstream } = await connect(s);
   const call = s.ai.calls[0];
   assert.equal(call.model, SPEECH_MODEL);
-  assert.deepEqual(call.inputs, { encoding: "linear16", sample_rate: "16000", keyterm: KEYTERMS });
+  assert.deepEqual(call.inputs, { encoding: "linear16", sample_rate: "16000", keyterm: KEYTERMS, mip_opt_out: "true" });
   assert.deepEqual(call.options, { websocket: true });
   assert.equal(upstream.accepted, true);
 
@@ -198,7 +201,7 @@ test("session: unknown text frames are ignored, and a frame over a second is ref
 
 // --- falling back ------------------------------------------------------------------------
 
-for (const behaviour of ["throws", "no-socket"] as const) {
+for (const behaviour of ["throws", "capacity", "no-socket"] as const) {
   test(`fallback: when Workers AI fails (${behaviour}), the page is told and the socket closes cleanly`, async () => {
     const s = setup({ ai: fakeAi(behaviour) });
     const res = await handle(listenRequest(), s.rt);
@@ -208,8 +211,52 @@ for (const behaviour of ["throws", "no-socket"] as const) {
     assert.deepEqual(server.closed, { code: 1000, reason: "fallback" });
     await s.settle();
     assert.equal((await s.core.open("203.0.113.7")).ok, true, "the failed session doesn't hold the visitor's slot");
+    assert.deepEqual(await s.core.status("198.51.100.4"), { available: true }, "only that session falls back");
+    await handle(listenRequest({ ip: "198.51.100.4" }), s.rt);
+    assert.equal(s.ai.runs.count, 2, "the next recording tries Workers AI again");
   });
 }
+
+test("quota: only Workers AI's daily-allowance refusal (3036) counts as the day being used up", () => {
+  assert.equal(isQuotaRefusal(new Error(AI_ERRORS.quota)), true);
+  assert.equal(isQuotaRefusal(new Error("InferenceUpstreamError: 3036: account limited")), true);
+  assert.equal(isQuotaRefusal(new Error("You have used up your daily free allocation of 10,000 neurons.")), true);
+  for (const other of [AI_ERRORS.capacity, AI_ERRORS.throws, "AiError: 13036: x", "3036abc", "Network connection lost.", ""]) {
+    assert.equal(isQuotaRefusal(new Error(other)), false, other);
+  }
+  assert.equal(isQuotaRefusal("AiError: 3036: daily free allocation"), true, "a thrown string, too");
+  assert.equal(isQuotaRefusal(undefined), false);
+});
+
+test("quota: when Workers AI says the account's allowance is used up, the day closes until midnight UTC without asking it again", async () => {
+  const s = setup({ ai: fakeAi("quota"), start: Date.UTC(2026, 10, 21, 22, 0, 0) });
+  await handle(listenRequest(), s.rt);
+  assert.deepEqual(s.servers[0].messages, [{ type: "fallback", reason: "cap" }]);
+  assert.deepEqual(s.servers[0].closed, { code: 1000, reason: "fallback" });
+  assert.equal(s.ai.runs.count, 1);
+  await s.settle();
+
+  const status = await handle(new Request(`https://sayfold.brightloopapps.com${STATUS_PATH}`), s.rt);
+  assert.deepEqual(await status.json(), { available: false });
+  for (const ip of ["203.0.113.7", "198.51.100.4", "198.51.100.5"]) {
+    await handle(listenRequest({ ip }), s.rt);
+    assert.deepEqual(s.servers.at(-1)!.messages, [{ type: "fallback", reason: "cap" }], ip);
+  }
+  assert.equal(s.ai.runs.count, 1, "no Flux call for the rest of the day");
+
+  s.clock.now = Date.UTC(2026, 10, 22, 0, 0, 0);
+  const next = await handle(new Request(`https://sayfold.brightloopapps.com${STATUS_PATH}`), s.rt);
+  assert.deepEqual(await next.json(), { available: true });
+  await handle(listenRequest(), s.rt);
+  assert.equal(s.ai.runs.count, 2, "tried again after midnight UTC");
+});
+
+test("quota: if the counter can't be told, that session still falls back", async () => {
+  const s = setup({ ai: fakeAi("quota") });
+  s.rt.meter.exhausted = async () => { throw new Error("Durable Object reset"); };
+  await handle(listenRequest(), s.rt);
+  assert.deepEqual(s.servers[0].messages, [{ type: "fallback", reason: "cap" }]);
+});
 
 test("fallback: Flux dropping the connection or sending an error tells the page", async () => {
   {
@@ -258,10 +305,15 @@ test("limits: a session takes at most 2 minutes of audio; Flux gets exactly that
   assert.deepEqual(server.closed, { code: 1000, reason: "fallback" });
 });
 
-test("limits: a session also ends after 2 minutes connected, audio or not", async () => {
+test("limits: a session also ends after 2 minutes connected, however little audio it sends", async () => {
   const s = setup();
   const { server, upstream } = await connect(s);
-  mock.timers.tick(SESSION_MAX_SECONDS * 1000 - 1);
+  for (let t = 0; t < SESSION_MAX_SECONDS - 1; t++) {
+    server.emit("message", audio(0.01));
+    mock.timers.tick(1000);
+  }
+  server.emit("message", audio(0.01));
+  mock.timers.tick(999);
   assert.deepEqual(upstream.messages, []);
   mock.timers.tick(1);
   assert.deepEqual(upstream.messages, [{ type: "CloseStream" }]);
@@ -378,4 +430,184 @@ test("privacy: the server code has no logging calls, and the Worker has no analy
     }
   }
   assert.equal(LISTEN_PATH, "/api/listen");
+});
+
+// --- connected time --------------------------------------------------------------------------
+
+/** The seconds counted against the visitor today. */
+const visitorSeconds = (s: ReturnType<typeof setup>) =>
+  (s.sql.db.prepare("SELECT seconds FROM visitors").get() as { seconds: number } | undefined)?.seconds ?? 0;
+
+test("idle: a recording that sends no audio is closed after the idle timeout, and its connected time is counted", async () => {
+  assert.equal(IDLE_SECONDS, 10);
+  const s = setup();
+  const { server, upstream } = await connect(s);
+  mock.timers.tick(IDLE_SECONDS * 1000 - 1);
+  assert.deepEqual(upstream.messages, []);
+  mock.timers.tick(1);
+  assert.deepEqual(upstream.messages, [{ type: "CloseStream" }], "Flux is asked for its last words");
+  upstream.emit("close");
+  assert.deepEqual(server.messages, [{ type: "fallback", reason: "idle" }]);
+  assert.deepEqual(server.closed, { code: 1000, reason: "fallback" });
+  await s.settle();
+  assert.equal(visitorSeconds(s), IDLE_SECONDS, "10 seconds connected, though no audio came");
+  const neurons = (s.sql.db.prepare("SELECT neurons FROM days").get() as { neurons: number }).neurons;
+  assert.ok(Math.abs(neurons - IDLE_SECONDS * NEURONS_PER_AUDIO_SECOND) < 1e-6, "and against the day's cap");
+});
+
+test("idle: audio keeps a recording open; a pause as long as the timeout closes it; empty frames don't count as audio", async () => {
+  const s = setup();
+  const { server, upstream } = await connect(s);
+  for (let t = 0; t < 30; t++) {
+    server.emit("message", audio(0.1));
+    mock.timers.tick(1000);
+  }
+  assert.deepEqual(upstream.messages, [], "still open after 30 seconds of slow audio");
+  server.emit("message", audio(0.1)); // the last audio
+  for (let t = 0; t < IDLE_SECONDS - 1; t++) {
+    server.emit("message", new Uint8Array(0));
+    server.emit("message", new ArrayBuffer(0));
+    mock.timers.tick(1000);
+  }
+  assert.deepEqual(upstream.messages, []);
+  mock.timers.tick(1000);
+  assert.deepEqual(upstream.messages, [{ type: "CloseStream" }]);
+  assert.equal(upstream.sent.filter((f) => typeof f !== "string" && f.length === 0).length, 0, "no empty frame reached Flux");
+});
+
+test("connected time: a slow recording counts the time it was connected, not just its audio", async () => {
+  const s = setup();
+  const { server, upstream } = await connect(s);
+  for (let t = 0; t < 30; t++) {
+    server.emit("message", audio(0.1));
+    mock.timers.tick(1000);
+  }
+  await s.settle();
+  assert.ok(visitorSeconds(s) >= 29, `reported as it goes: ${visitorSeconds(s)}`);
+  server.emit("message", STOP);
+  upstream.emit("close");
+  await s.settle();
+  assert.equal(visitorSeconds(s), 30, "30 seconds connected, 3 of audio");
+});
+
+test("connected time: audio sent faster than real time still counts in full", async () => {
+  const s = setup();
+  const { server, upstream } = await connect(s);
+  for (let i = 0; i < 20; i++) server.emit("message", audio(1));
+  mock.timers.tick(2000);
+  server.emit("message", STOP);
+  upstream.emit("close");
+  await s.settle();
+  assert.equal(visitorSeconds(s), 20);
+});
+
+test("connected time: the visitor's daily budget is spent by time connected, so reconnecting doesn't get round it", async () => {
+  const s = setup();
+  let sessions = 0;
+  for (;;) {
+    await handle(listenRequest(), s.rt);
+    const server = s.servers.at(-1)!;
+    const upstream = s.ai.calls.at(-1)?.upstream;
+    if (server.messages.length) {
+      assert.deepEqual(server.messages, [{ type: "fallback", reason: "visitor-limit" }]);
+      break;
+    }
+    sessions++;
+    mock.timers.tick(IDLE_SECONDS * 1000); // connect, say nothing, get closed
+    upstream!.emit("close");
+    await s.settle();
+    assert.ok(sessions < 100, "reconnecting must run out");
+  }
+  assert.equal(sessions, VISITOR_SECONDS_PER_DAY / IDLE_SECONDS);
+  assert.equal(visitorSeconds(s), VISITOR_SECONDS_PER_DAY);
+});
+
+test("connected time: a visitor with a minute left is stopped after a minute connected, audio or not", async () => {
+  const s = setup();
+  const first = await connect(s);
+  for (let i = 0; i < 120; i++) first.server.emit("message", audio(1));
+  await s.settle();
+  first.upstream.emit("close");
+  await s.settle();
+  const { server, upstream } = await connect(s);
+  for (let t = 0; t < 59; t++) {
+    server.emit("message", audio(0.01));
+    mock.timers.tick(1000);
+  }
+  await s.settle();
+  assert.deepEqual(upstream.messages, []);
+  server.emit("message", audio(0.01));
+  mock.timers.tick(1000);
+  await s.settle();
+  assert.deepEqual(upstream.messages, [{ type: "CloseStream" }]);
+  upstream.emit("close");
+  assert.deepEqual(server.messages, [{ type: "fallback", reason: "visitor-limit" }]);
+});
+
+test("connected time: near the day's cap, a slow recording is stopped by the time it holds Flux", async () => {
+  const s = setup();
+  await nearlyCap(s, 5);
+  const { server, upstream } = await connect(s, "198.51.100.1");
+  for (let t = 0; t < 10 && upstream.messages.length === 0; t++) {
+    server.emit("message", audio(0.01));
+    mock.timers.tick(1000);
+    await s.settle();
+  }
+  assert.deepEqual(upstream.messages, [{ type: "CloseStream" }]);
+  upstream.emit("close");
+  assert.deepEqual(server.messages, [{ type: "fallback", reason: "cap" }]);
+});
+
+// --- frames -----------------------------------------------------------------------------------
+
+test("frames: only whole 16-bit samples reach Flux; an odd last byte is dropped, never forwarded or split", async () => {
+  const s = setup();
+  const { server, upstream } = await connect(s);
+  server.emit("message", new Uint8Array([1]));
+  server.emit("message", new Uint8Array([1, 2, 3]));
+  server.emit("message", new Uint8Array([4, 5, 6, 7, 8]).subarray(1));
+  assert.deepEqual(upstream.bytes, new Uint8Array([1, 2, 5, 6, 7, 8]));
+  for (const f of upstream.sent) assert.ok(typeof f === "string" || f.length % 2 === 0, `a frame of ${f.length} bytes`);
+});
+
+test("frames: at the session's limit, the last frame is cut to whole samples too", async () => {
+  const s = setup();
+  const { server, upstream } = await connect(s);
+  const odd = audio(0.5).subarray(1); // 15,999 bytes
+  for (let i = 0; i < SESSION_MAX_SECONDS * 2 + 10; i++) server.emit("message", odd);
+  await s.settle();
+  assert.ok(upstream.bytes.length <= SESSION_MAX_SECONDS * BYTES_PER_SECOND);
+  for (const f of upstream.sent) assert.ok(typeof f === "string" || f.length % 2 === 0, `a frame of ${f.length} bytes`);
+  assert.equal(upstream.bytes.length % 2, 0);
+});
+
+test("listen: only a GET can open the WebSocket", async () => {
+  const s = setup();
+  for (const method of ["POST", "PUT", "DELETE", "PATCH"]) {
+    const res = await handle(listenRequest({ method }), s.rt);
+    assert.equal(res.status, 405, method);
+    assert.equal(res.headers.get("allow"), "GET");
+  }
+  assert.equal(s.servers.length, 0);
+  assert.equal(s.ai.runs.count, 0);
+  assert.equal((await handle(listenRequest(), s.rt)).status, 101);
+});
+
+// --- the smoke test ---------------------------------------------------------------------------
+
+test("smoke: lab.json checks the status endpoint, and a plain GET of every smoke path is a 200 that opens nothing", async () => {
+  const { readFileSync } = await import("node:fs");
+  const { join } = await import("node:path");
+  const lab = JSON.parse(readFileSync(join(import.meta.dirname, "../../lab.json"), "utf8")) as { smoke: string[] };
+  assert.ok(lab.smoke.includes("/"));
+  assert.ok(lab.smoke.includes(STATUS_PATH));
+  assert.ok(!lab.smoke.includes(LISTEN_PATH));
+  const s = setup();
+  for (const path of lab.smoke) {
+    // As nightshift/bin/smoke.ts sends it: fetch(url, { redirect: "follow" }), no upgrade or origin.
+    const res = await handle(new Request(`https://sayfold.erko-erka1.workers.dev${path}`, { redirect: "follow" }), s.rt);
+    assert.equal(res.status, 200, path);
+  }
+  assert.equal(s.servers.length, 0, "no WebSocket");
+  assert.equal(s.ai.runs.count, 0, "no Workers AI");
 });
