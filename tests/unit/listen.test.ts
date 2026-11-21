@@ -220,12 +220,58 @@ for (const behaviour of ["throws", "capacity", "no-socket"] as const) {
 test("quota: only Workers AI's daily-allowance refusal (3036) counts as the day being used up", () => {
   assert.equal(isQuotaRefusal(new Error(AI_ERRORS.quota)), true);
   assert.equal(isQuotaRefusal(new Error("InferenceUpstreamError: 3036: account limited")), true);
+  assert.equal(isQuotaRefusal(new Error("3036: account limited")), true);
   assert.equal(isQuotaRefusal(new Error("You have used up your daily free allocation of 10,000 neurons.")), true);
-  for (const other of [AI_ERRORS.capacity, AI_ERRORS.throws, "AiError: 13036: x", "3036abc", "Network connection lost.", ""]) {
+  assert.equal(isQuotaRefusal(Object.assign(new Error("Account limited"), { code: 3036 })), true, "an error code of 3036");
+  assert.equal(isQuotaRefusal({ code: "3036", message: "x" }), true, "the code as a string, too");
+  for (const other of [AI_ERRORS.capacity, AI_ERRORS.throws, "AiError: 13036: x", "AiError: 30360: x", "3036abc", "Network connection lost.", "",
+    "timeout after 3036 ms", "Request 3036 failed", "AiError: 3040: retry in 3036 ms", "id 3036", "3036"]) {
     assert.equal(isQuotaRefusal(new Error(other)), false, other);
   }
+  for (const code of [3040, "13036", 30360, null]) assert.equal(isQuotaRefusal({ code, message: "timeout after 3036 ms" }), false, String(code));
   assert.equal(isQuotaRefusal("AiError: 3036: daily free allocation"), true, "a thrown string, too");
   assert.equal(isQuotaRefusal(undefined), false);
+});
+
+test("quota: an error that only mentions 3036 (a timeout of 3036 ms) falls back for that recording, and the day stays open", async () => {
+  const s = setup({ ai: { ...fakeAi(), ai: { run: async () => { throw new Error("AiError: 3040: timeout after 3036 ms"); } } } });
+  await handle(listenRequest(), s.rt);
+  assert.deepEqual(s.servers[0].messages, [{ type: "fallback", reason: "error" }]);
+  await s.settle();
+  assert.deepEqual(await s.core.status("198.51.100.4"), { available: true });
+});
+
+test("quota: a Workers AI error with code 3036 closes the day", async () => {
+  const s = setup({ ai: { ...fakeAi(), ai: { run: async () => { throw Object.assign(new Error("Account limited"), { code: 3036 }); } } } });
+  await handle(listenRequest(), s.rt);
+  assert.deepEqual(s.servers[0].messages, [{ type: "fallback", reason: "cap" }]);
+  await s.settle();
+  assert.deepEqual(await s.core.status("198.51.100.4"), { available: false });
+});
+
+test("quota: Flux reporting the daily refusal mid-stream closes the day with cap, not error", async () => {
+  for (const error of [
+    { type: "Error", code: 3036, description: "Account limited" },
+    { type: "Error", code: "INTERNAL", description: "AiError: 3036: You have used up your daily free allocation of 10,000 neurons." },
+    { type: "Error", code: "INTERNAL", message: "You have used up your daily free allocation of 10,000 neurons." },
+  ]) {
+    const s = setup();
+    const { server, upstream } = await connect(s);
+    server.emit("message", audio(1));
+    upstream.emit("message", flux("Update", "Water the"));
+    upstream.emit("message", JSON.stringify(error));
+    await s.settle();
+    assert.deepEqual(server.messages, [{ type: "update", turn: 0, text: "Water the" }, { type: "fallback", reason: "cap", seconds: 1 }], JSON.stringify(error));
+    assert.ok(upstream.closed);
+    assert.deepEqual(await s.core.status("198.51.100.4"), { available: false }, "the rest of the day falls back");
+  }
+  // Any other Flux error is that recording's error only, even one that mentions 3036.
+  const s = setup();
+  const { server, upstream } = await connect(s);
+  upstream.emit("message", JSON.stringify({ type: "Error", code: "TIMEOUT", description: "timeout after 3036 ms" }));
+  await s.settle();
+  assert.deepEqual(server.messages, [{ type: "fallback", reason: "error" }]);
+  assert.deepEqual(await s.core.status("198.51.100.4"), { available: true });
 });
 
 test("quota: when Workers AI says the account's allowance is used up, the day closes until midnight UTC without asking it again", async () => {
@@ -282,6 +328,23 @@ test("fallback: Flux dropping the connection or sending an error tells the page"
   }
 });
 
+test("fallback: says how many seconds of audio it took, so the page can turn the rest into text itself", async () => {
+  const s = setup();
+  const { server, upstream } = await connect(s);
+  for (let i = 0; i < 25; i++) server.emit("message", audio(0.08));
+  upstream.emit("message", flux("Update", "Water the"));
+  upstream.emit("close");
+  assert.deepEqual(server.messages, [{ type: "update", turn: 0, text: "Water the" }, { type: "fallback", reason: "error", seconds: 2 }]);
+  // Audio sent once the server has stopped taking it isn't counted as taken.
+  const t = setup();
+  const b = await connect(t);
+  b.server.emit("message", audio(1));
+  mock.timers.tick(IDLE_SECONDS * 1000);
+  b.server.emit("message", audio(1)); // too late: draining
+  b.upstream.emit("close");
+  assert.deepEqual(b.server.messages, [{ type: "fallback", reason: "idle", seconds: 1 }]);
+});
+
 test("fallback: a second recording from the same visitor gets busy, without opening Flux", async () => {
   const s = setup();
   await connect(s);
@@ -301,7 +364,7 @@ test("limits: a session takes at most 2 minutes of audio; Flux gets exactly that
   assert.equal(upstream.bytes.length, SESSION_MAX_SECONDS * BYTES_PER_SECOND);
   assert.deepEqual(upstream.messages, [{ type: "CloseStream" }]);
   upstream.emit("close");
-  assert.deepEqual(server.messages, [{ type: "fallback", reason: "session-limit" }]);
+  assert.deepEqual(server.messages, [{ type: "fallback", reason: "session-limit", seconds: SESSION_MAX_SECONDS }], "with the seconds of audio taken");
   assert.deepEqual(server.closed, { code: 1000, reason: "fallback" });
 });
 
@@ -318,7 +381,7 @@ test("limits: a session also ends after 2 minutes connected, however little audi
   mock.timers.tick(1);
   assert.deepEqual(upstream.messages, [{ type: "CloseStream" }]);
   mock.timers.tick(DRAIN_MS);
-  assert.deepEqual(server.messages, [{ type: "fallback", reason: "session-limit" }]);
+  assert.deepEqual(server.messages, [{ type: "fallback", reason: "session-limit", seconds: 1.2 }]);
   assert.deepEqual(server.closed, { code: 1000, reason: "fallback" });
 });
 
@@ -333,7 +396,7 @@ test("limits: a visitor's 3 minutes a day are counted across sessions; the rest 
   await s.settle();
   assert.equal(second.upstream.bytes.length, 60 * BYTES_PER_SECOND, "only the minute left");
   second.upstream.emit("close");
-  assert.deepEqual(second.server.messages, [{ type: "fallback", reason: "visitor-limit" }]);
+  assert.deepEqual(second.server.messages, [{ type: "fallback", reason: "visitor-limit", seconds: 60 }]);
   await s.settle();
   await handle(listenRequest(), s.rt);
   assert.deepEqual(s.servers.at(-1)!.messages, [{ type: "fallback", reason: "visitor-limit" }]);
@@ -350,12 +413,12 @@ test("cap: crossing 9,000 tells every open session and closes it; new sessions f
   // A crossed the cap: it stops taking audio and is told once Flux has finished.
   assert.deepEqual(a.upstream.messages, [{ type: "CloseStream" }]);
   a.upstream.emit("close");
-  assert.deepEqual(a.server.messages, [{ type: "fallback", reason: "cap" }]);
+  assert.deepEqual(a.server.messages, [{ type: "fallback", reason: "cap", seconds: 3 }]);
   // B is told at its next report.
   b.server.emit("message", audio(1));
   await s.settle();
   b.upstream.emit("close");
-  assert.deepEqual(b.server.messages, [{ type: "fallback", reason: "cap" }]);
+  assert.deepEqual(b.server.messages, [{ type: "fallback", reason: "cap", seconds: 1 }]);
   assert.deepEqual(b.server.closed, { code: 1000, reason: "fallback" });
 
   const status = await handle(new Request(`https://sayfold.brightloopapps.com${STATUS_PATH}`), s.rt);
@@ -541,7 +604,7 @@ test("connected time: a visitor with a minute left is stopped after a minute con
   await s.settle();
   assert.deepEqual(upstream.messages, [{ type: "CloseStream" }]);
   upstream.emit("close");
-  assert.deepEqual(server.messages, [{ type: "fallback", reason: "visitor-limit" }]);
+  assert.deepEqual(server.messages, [{ type: "fallback", reason: "visitor-limit", seconds: 0.6 }]);
 });
 
 test("connected time: near the day's cap, a slow recording is stopped by the time it holds Flux", async () => {
@@ -555,7 +618,9 @@ test("connected time: near the day's cap, a slow recording is stopped by the tim
   }
   assert.deepEqual(upstream.messages, [{ type: "CloseStream" }]);
   upstream.emit("close");
-  assert.deepEqual(server.messages, [{ type: "fallback", reason: "cap" }]);
+  const [m] = server.messages as { type: string; reason: string; seconds: number }[];
+  assert.deepEqual({ ...m, seconds: undefined }, { type: "fallback", reason: "cap", seconds: undefined });
+  assert.equal(m.seconds, upstream.bytes.length / BYTES_PER_SECOND);
 });
 
 // --- frames -----------------------------------------------------------------------------------

@@ -47,7 +47,8 @@ test("the allow-list: a pageview, a recording started, a transcript ready with o
   assert.deepEqual(EVENTS.play_started, {});
   assert.deepEqual(EVENTS.play_finished, {
     seconds_bucket: ["0-9", "10-29", "30-59", "60-119", "120+"],
-    backend: ["webgpu", "wasm"],
+    // "server": live text turned the whole recording into text; otherwise the in-browser model's backend did (some of) it.
+    backend: ["webgpu", "wasm", "server"],
   });
 });
 
@@ -71,11 +72,15 @@ test("each recording sends one play_started, and its transcript one play_finishe
   plays.finished(12.4, "wasm"); // the same transcript again: not sent twice
   plays.started(); // Record again
   plays.finished(130, "webgpu");
+  plays.started();
+  plays.finished(4, "server");
   assert.deepEqual(sent, [
     ["play_started", {}],
     ["play_finished", { seconds_bucket: "10-29", backend: "wasm" }],
     ["play_started", {}],
     ["play_finished", { seconds_bucket: "120+", backend: "webgpu" }],
+    ["play_started", {}],
+    ["play_finished", { seconds_bucket: "0-9", backend: "server" }],
   ]);
   for (const [name, props] of sent) {
     const spec = EVENTS[name as keyof typeof EVENTS] as Record<string, readonly unknown[]>;

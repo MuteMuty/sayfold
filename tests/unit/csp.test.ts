@@ -4,11 +4,19 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { CSP, directives } from "../../src/csp.ts";
+import { ORIGINS } from "../../src/server/config.ts";
 
 const policy = (csp: string) => new Map(csp.split(";").map((d) => d.trim().split(/\s+/)).filter((d) => d[0]).map(([k, ...v]) => [k!, v]));
 
-test("connect-src allows only Sayfold itself, GitHub's API and the hub's likes and analytics", () => {
-  assert.deepEqual(policy(CSP).get("connect-src"), ["'self'", "https://api.github.com", "https://lab.brightloopapps.com", "https://eu.i.posthog.com"]);
+test("connect-src allows only Sayfold itself (its live-text WebSocket named too), GitHub's API and the hub's likes and analytics", () => {
+  assert.deepEqual(policy(CSP).get("connect-src"), [
+    "'self'", "wss://sayfold.brightloopapps.com", "wss://sayfold.erko-erka1.workers.dev",
+    "https://api.github.com", "https://lab.brightloopapps.com", "https://eu.i.posthog.com",
+  ]);
+});
+
+test("the WebSocket addresses are exactly the Worker's own origins, on wss:", () => {
+  assert.deepEqual(policy(CSP).get("connect-src")!.filter((v) => v.startsWith("wss:")), ORIGINS.map((o) => o.replace(/^https:/, "wss:")));
 });
 
 test("everything else defaults to Sayfold itself, with nothing to embed and no forms to post", () => {

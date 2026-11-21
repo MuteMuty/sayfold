@@ -28,9 +28,21 @@ export function nextUtcMidnight(ms: number): number {
   return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1);
 }
 
-/** What the Durable Object's alarm runs, and what it runs when it starts: delete earlier days, set the next alarm. */
-export async function sweepAndSchedule(core: MeterCore, storage: { setAlarm(ms: number): Promise<void> | void }): Promise<void> {
-  await storage.setAlarm(core.sweep());
+/**
+ * What the Durable Object's alarm runs, and what it runs when it starts: delete earlier days, set the next
+ * alarm. A sweep that fails (storage busy, say) still sets the next midnight, so the alarm never stops; that
+ * sweep's rows go at the next one, or with the first request of the new day (MeterCore.today).
+ */
+export async function sweepAndSchedule(
+  core: MeterCore, storage: { setAlarm(ms: number): Promise<void> | void }, now: () => number = Date.now,
+): Promise<void> {
+  let next: number;
+  try {
+    next = core.sweep();
+  } catch {
+    next = nextUtcMidnight(now());
+  }
+  await storage.setAlarm(next);
 }
 
 const hex = (bytes: ArrayBuffer | Uint8Array): string =>

@@ -1,5 +1,6 @@
 // The microphone, kept in memory only while recording: raw samples from an AudioWorklet, plus an
-// AnalyserNode for the live waveform. Stopping releases the microphone and hands back the samples, in one channel.
+// AnalyserNode for the live waveform. Each batch can also go to live text as it comes. Stopping releases the
+// microphone and hands back the samples, in one channel.
 import workletUrl from "./capture.worklet.ts?worker&url";
 import { capReached, cappedFrames } from "../core/time.ts";
 import { toMono } from "../core/resample.ts";
@@ -22,7 +23,9 @@ export class Recorder {
   private readonly analyser: AnalyserNode;
   private readonly node: AudioWorkletNode;
 
-  private constructor(ctx: AudioContext, stream: MediaStream, analyser: AnalyserNode, node: AudioWorkletNode, onCap: () => void) {
+  private constructor(
+    ctx: AudioContext, stream: MediaStream, analyser: AnalyserNode, node: AudioWorkletNode, onCap: () => void, onAudio?: (mono: Float32Array, rate: number) => void,
+  ) {
     this.ctx = ctx;
     this.stream = stream;
     this.analyser = analyser;
@@ -32,12 +35,16 @@ export class Recorder {
       const mono = toMono(e.data.channels);
       this.chunks.push(mono);
       this.frames += mono.length;
+      onAudio?.(mono, ctx.sampleRate);
       if (capReached(this.frames, ctx.sampleRate)) onCap();
     };
   }
 
-  /** Ask for the microphone and start recording. Call from a click or key press (browsers need the gesture for audio). */
-  static async start(onCap: () => void): Promise<Recorder> {
+  /**
+   * Ask for the microphone and start recording. Call from a click or key press (browsers need the gesture for
+   * audio). `onAudio` gets each batch as it comes (about 85 ms, in one channel), for live text.
+   */
+  static async start(onCap: () => void, onAudio?: (mono: Float32Array, rate: number) => void): Promise<Recorder> {
     // Created before the permission prompt, while the gesture still counts.
     const ctx = new AudioContext();
     try {
@@ -58,7 +65,7 @@ export class Recorder {
       const node = new AudioWorkletNode(ctx, "sayfold-capture", { numberOfOutputs: 0 });
       source.connect(analyser);
       source.connect(node);
-      return new Recorder(ctx, stream, analyser, node, onCap);
+      return new Recorder(ctx, stream, analyser, node, onCap, onAudio);
     } catch (e) {
       void ctx.close().catch(() => {});
       throw e;

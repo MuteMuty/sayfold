@@ -34,8 +34,13 @@ export const DAILY_NEURON_CAP = 9000;
  * the account can do before Sayfold's own estimate gets there. Its errors page gives it as code 3036, "You
  * have used up your daily free allocation of 10,000 neurons". It closes the day as the cap does. Any other
  * error (3040 "Capacity temporarily exceeded", say) falls back for that recording only.
+ *
+ * It counts only as an error code of 3036, a message in Workers AI's "AiError: 3036: …" form (3036 right
+ * before a colon, at the start or after one), or the "daily free allocation" wording: never a 3036 anywhere
+ * else in a message, such as "timeout after 3036 ms".
  */
-export const QUOTA_REFUSAL = /\b3036\b|daily free allocation/i;
+export const QUOTA_CODE = 3036;
+export const QUOTA_REFUSAL = /(?:^|:\s*)3036:|daily free allocation/i;
 
 // Per visitor, by a salted hash of the IP address and the day only (the salt is new every UTC day).
 

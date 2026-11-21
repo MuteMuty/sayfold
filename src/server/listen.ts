@@ -7,7 +7,7 @@ import {
   type FallbackReason, type ListenStatus, type ServerMessage,
 } from "../listen/protocol.ts";
 import {
-  DRAIN_MS, IDLE_SECONDS, KEYTERMS, LOCAL_ORIGIN, MAX_FRAME_BYTES, MIP_OPT_OUT, ORIGINS, QUOTA_REFUSAL, REPORT_EVERY_SECONDS,
+  DRAIN_MS, IDLE_SECONDS, KEYTERMS, LOCAL_ORIGIN, MAX_FRAME_BYTES, MIP_OPT_OUT, ORIGINS, QUOTA_CODE, QUOTA_REFUSAL, REPORT_EVERY_SECONDS,
   SESSION_MAX_SECONDS, SPEECH_MODEL,
 } from "./config.ts";
 import type { Added, Opened } from "./meter.ts";
@@ -81,11 +81,24 @@ async function listen(request: Request, rt: Runtime): Promise<Response> {
   return rt.upgrade(client);
 }
 
-/** Whether Workers AI refused because the account's daily free allocation is used up (QUOTA_REFUSAL). */
-export const isQuotaRefusal = (error: unknown): boolean => error != null && QUOTA_REFUSAL.test(String(error));
+/**
+ * Whether Workers AI refused because the account's daily free allocation is used up: an error (or Flux's
+ * Error message) whose `code` is 3036, or whose text is in the refusal's own form (QUOTA_REFUSAL).
+ */
+export function isQuotaRefusal(error: unknown): boolean {
+  if (error == null) return false;
+  if (typeof error !== "object") return QUOTA_REFUSAL.test(String(error));
+  const e = error as { code?: unknown; message?: unknown; description?: unknown };
+  if (e.code === QUOTA_CODE || e.code === String(QUOTA_CODE)) return true;
+  const texts = [e.message, e.description].filter((t): t is string => typeof t === "string");
+  return texts.some((t) => QUOTA_REFUSAL.test(t));
+}
 
-/** Flux's messages as the page's, or "error" when Flux reports one. Anything else is dropped. */
-export function fromFlux(data: unknown): ServerMessage | "error" | null {
+/**
+ * Flux's messages as the page's; "quota" when Flux reports the account's daily refusal, and "error" for any
+ * other error it reports. Anything else is dropped.
+ */
+export function fromFlux(data: unknown): ServerMessage | "error" | "quota" | null {
   if (typeof data !== "string") return null;
   let m: { type?: unknown; event?: unknown; turn_index?: unknown; transcript?: unknown };
   try {
@@ -94,7 +107,7 @@ export function fromFlux(data: unknown): ServerMessage | "error" | null {
     return null;
   }
   if (typeof m !== "object" || m === null) return null;
-  if (m.type === "Error") return "error";
+  if (m.type === "Error") return isQuotaRefusal(m) ? "quota" : "error";
   if (m.type !== "TurnInfo" || typeof m.turn_index !== "number" || typeof m.transcript !== "string") return null;
   return { type: m.event === "EndOfTurn" ? "end-of-turn" : "update", turn: m.turn_index, text: m.transcript };
 }
@@ -145,10 +158,7 @@ class Session {
     } catch (error) {
       // Workers AI refused or failed (a retired model, a busy moment): this recording falls back. When it's
       // the account's allowance for the day, the rest of the day does, without asking Workers AI again.
-      if (isQuotaRefusal(error)) {
-        await this.rt.meter.exhausted().catch(() => {});
-        return this.end("cap");
-      }
+      if (isQuotaRefusal(error)) return this.quota();
     }
     if (!this.flux) return this.end("error");
     const flux = this.flux;
@@ -207,12 +217,19 @@ class Session {
     if (this.state === "closed") return;
     const m = fromFlux(data);
     if (m === "error") return this.end("error");
+    if (m === "quota") return this.rt.waitUntil(this.quota());
     if (!m) return;
     try {
       this.client.send(JSON.stringify(m));
     } catch {
       this.end(); // The page has gone.
     }
+  }
+
+  /** Workers AI refused for the day: this recording falls back, and so does the rest of the UTC day. */
+  private async quota(): Promise<void> {
+    this.end("cap");
+    await this.rt.meter.exhausted().catch(() => {});
   }
 
   /** Reports to the counter a second at a time, and stops the session when the counter says so. */
@@ -258,7 +275,9 @@ class Session {
     if (this.timer !== null) clearTimeout(this.timer);
     if (this.ticker !== null) clearInterval(this.ticker);
     try {
-      if (reason) this.client.send(JSON.stringify({ type: "fallback", reason } satisfies ServerMessage));
+      // With the seconds of audio taken, if any: the page turns what came after them into text itself.
+      const seconds = this.sentBytes / BYTES_PER_SECOND;
+      if (reason) this.client.send(JSON.stringify({ type: "fallback", reason, ...(seconds > 0 && { seconds }) } satisfies ServerMessage));
       this.client.close(code, why);
     } catch {
       // The page has gone already.

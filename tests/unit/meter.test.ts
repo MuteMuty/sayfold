@@ -220,6 +220,23 @@ test("the midnight alarm: with no traffic at all, earlier days' salts and counts
   assert.deepEqual(dump(db).sessions, []);
 });
 
+test("the midnight alarm: when the sweep fails, the next midnight is still set", async () => {
+  const sql = memorySql();
+  const clock = { now: Date.UTC(2026, 10, 21, 23, 50, 0) };
+  const core = new MeterCore(sql, () => clock.now);
+  clock.now = Date.UTC(2026, 10, 22, 0, 0, 1);
+  const broken = { exec: () => { throw new Error("SQLITE_BUSY"); } };
+  (core as unknown as { sql: unknown }).sql = broken;
+  const alarms: number[] = [];
+  await sweepAndSchedule(core, { setAlarm: async (ms: number) => void alarms.push(ms) }, () => clock.now);
+  assert.deepEqual(alarms, [Date.UTC(2026, 10, 23)]);
+  // And once storage works again, the next alarm sweeps as usual.
+  (core as unknown as { sql: unknown }).sql = sql;
+  clock.now = Date.UTC(2026, 10, 23, 0, 0, 0);
+  await sweepAndSchedule(core, { setAlarm: async (ms: number) => void alarms.push(ms) }, () => clock.now);
+  assert.deepEqual(alarms.at(-1), Date.UTC(2026, 10, 24));
+});
+
 test("the midnight alarm: the in-memory key for yesterday's salt goes with it", async () => {
   const { core, db, clock } = meter(Date.UTC(2026, 10, 21, 23, 50, 0));
   await openOk(core);

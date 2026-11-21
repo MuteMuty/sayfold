@@ -4,11 +4,11 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <title>Sayfold: say an idea, get it as text</title>
-    <meta name="description" content="Press record, say an idea, review it as text, and send it to your own GitHub repo as an issue. Speech is turned into text in your browser, so your voice never leaves your device." />
+    <meta name="description" content="Press record, say an idea and watch it turn into text while you talk. Review it, then send it to your own GitHub repo as an issue." />
     <meta name="theme-color" content="#0f1714" media="(prefers-color-scheme: dark)" />
     <meta name="theme-color" content="#eef1ec" media="(prefers-color-scheme: light)" />
     <meta property="og:title" content="Sayfold" />
-    <meta property="og:description" content="Say an idea, get it as text. Speech to text runs in your browser." />
+    <meta property="og:description" content="Say an idea, get it as text, and send it to your own GitHub repo." />
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
   </head>
   <body data-state="idle">
@@ -36,7 +36,13 @@
         <canvas id="wave" class="wave" aria-hidden="true"></canvas>
         <p id="clock" class="clock"><span id="clock-now">0:00</span><span class="clock-cap"> / 2:00</span></p>
 
-        <button id="rec" class="rec" type="button" aria-describedby="rec-help">
+        <!-- Live text: the words as Sayfold's server hears them, while you talk (lab#109). Shown only while it's in use. -->
+        <div id="live" class="live">
+          <div class="live-scroll"><p id="live-text" class="live-text" data-hint="Your words show here as you talk."></p></div>
+          <p id="live-note" class="live-note" role="status" hidden></p>
+        </div>
+
+        <button id="rec" class="rec" type="button" aria-describedby="rec-help promise">
           <span class="rec-glyph" aria-hidden="true"></span>
           <span id="rec-label" class="rec-label">Record</span>
         </button>
@@ -106,7 +112,8 @@
         </div>
       </section>
 
-      <p class="promise">Speech is turned into text on this device, and your voice never leaves it. Your words go only to your own GitHub repo, straight from this browser, when you press Send.</p>
+      <!-- What happens to what you say, before you record. When live text is off, main.ts says it stays on this device, but never about a recording that was sent. -->
+      <p id="promise" class="promise">What you say is sent to Sayfold's server to be turned into text, and isn't kept. Your words go to your own GitHub repo only when you press Send.</p>
     </main>
 
     <!-- Says each change of state to screen readers: recording, transcribing, ready. -->
@@ -117,7 +124,7 @@
     <dialog id="gh" class="gh" aria-labelledby="gh-h" data-mode="form">
       <form id="gh-form" class="gh-form" novalidate>
         <h2 id="gh-h" class="gh-title">Send ideas to GitHub</h2>
-        <p class="gh-intro">Each idea you send becomes an issue in a repo of yours. Sayfold has no server: your token and your text go straight from this browser to GitHub's API (api.github.com), and nowhere else.</p>
+        <p class="gh-intro">Each idea you send becomes an issue in a repo of yours. Your token and the issue go straight from this browser to GitHub's API (api.github.com), never through Sayfold's server.</p>
         <label class="field-label" for="gh-repo">Repo</label>
         <input id="gh-repo" class="field" type="text" inputmode="url" placeholder="owner/name or its github.com link" autocomplete="off" autocapitalize="off" spellcheck="false" aria-describedby="gh-repo-err" />
         <p id="gh-repo-err" class="err"></p>
