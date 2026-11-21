@@ -9,7 +9,9 @@
 //   last turn, so its words may arrive only as an `update`: when the socket closes, keep the latest
 //   `update` of any turn that didn't end as that turn's text.
 // - A `fallback` can come in the middle of a turn. Keep the text received so far (the ended turns and the
-//   latest `update`), and transcribe what comes after it with the in-browser model.
+//   latest `update`), and transcribe what comes after it with the in-browser model. Its `seconds` say how
+//   much of the audio the server took (none when absent): the server drains Flux's last words for that audio
+//   before it sends the fallback, so the in-browser model takes the recording from there.
 // - Send audio continuously, silence included: a socket with no audio for a few seconds is closed (`idle`).
 
 export const LISTEN_PATH = "/api/listen";
@@ -44,7 +46,8 @@ export type ServerMessage =
   | { type: "update"; turn: number; text: string }
   /** The turn is finished: its final text. The next turn starts with a higher number. */
   | { type: "end-of-turn"; turn: number; text: string }
-  | { type: "fallback"; reason: FallbackReason };
+  /** `seconds`: the audio the server took and turned into text, from the start of the stream; absent when none. */
+  | { type: "fallback"; reason: FallbackReason; seconds?: number };
 
 /** A text frame from the page, or null when it isn't one the protocol knows. */
 export function parseClientMessage(data: string): ClientMessage | null {
