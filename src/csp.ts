@@ -3,12 +3,16 @@
 // API (where the visitor's own token sends their idea), and to the lab hub: its like counter and the
 // shared analytics script, which sends to PostHog's EU host. Nothing else can be fetched, beaconed or
 // loaded as an image, so the token and the text have nowhere else to go.
+//
+// Sayfold's live-text WebSocket (lab#109) is on its own origin, which 'self' covers, but Safari hasn't
+// always matched 'self' to wss:, so its addresses are named too: the Worker's own origins, on wss:.
+import { ORIGINS } from "./server/config.ts";
 
 export const directives = {
   "default-src": ["'self'"],
   // WebAssembly may compile: the speech runtime is WebAssembly, and some browsers give a worker the page's policy.
   "script-src": ["'self'", "'wasm-unsafe-eval'", "https://lab.brightloopapps.com"],
-  "connect-src": ["'self'", "https://api.github.com", "https://lab.brightloopapps.com", "https://eu.i.posthog.com"],
+  "connect-src": ["'self'", ...ORIGINS.map((o) => o.replace(/^https:/, "wss:")), "https://api.github.com", "https://lab.brightloopapps.com", "https://eu.i.posthog.com"],
   "img-src": ["'self'", "data:"],
   "object-src": ["'none'"],
   "base-uri": ["'none'"],

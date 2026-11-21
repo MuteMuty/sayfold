@@ -27,6 +27,11 @@
 // permission never answers getUserMedia, even for the fake device; the playtest then says so and
 // plays the same clip through an in-page stand-in for getUserMedia instead.
 //
+// Live text (lab#109): Sayfold's /api/listen/status and its /api/listen WebSocket are stand-ins here too
+// (Playwright routes), so nothing ever reaches the real Worker or Workers AI, whose free allowance the whole
+// account shares. Most checks answer the status with "unavailable", so they exercise the in-browser model as
+// before; the "live" checks stream to a scripted stand-in server, and fall back from it in every way it can.
+//
 // Every request is watched (pages and the speech worker): nothing may go anywhere but Sayfold's own
 // origin, the lab hub's like API and GitHub's API, both mocked here (never the live ones, and never a
 // real token). The made-up token must only ever reach api.github.com. On localhost the shared analytics
@@ -242,10 +247,121 @@ async function mockLikes(ctx, mode: "ok" | "down" = "ok") {
   return api;
 }
 
-async function openPage(name: string, opts, { likes = "ok" as "ok" | "down", init = null as null | (() => void), quiet = null as null | RegExp, refused = [] as string[], mic = null as null | { b64: string; snr?: number } } = {}) {
+// --- live text: a stand-in for Sayfold's Worker -------------------------------------------------------------
+/** One step of what the stand-in "hears": sent once this many seconds of audio have come. */
+type Step = { at: number; type: "update" | "end-of-turn"; turn: number; text: string };
+/** What the page hears as you'd say the clip: "New idea. Water the tomatoes every morning, and call the plumber on Friday." */
+const IDEA_STEPS: Step[] = [
+  { at: 0.4, type: "update", turn: 0, text: "New" },
+  { at: 0.8, type: "end-of-turn", turn: 0, text: "New idea." },
+  { at: 1.4, type: "update", turn: 1, text: "Water the" },
+  { at: 2.0, type: "update", turn: 1, text: "Water the tomatoes" },
+  { at: 2.7, type: "update", turn: 1, text: "Water the tomatoes every morning," },
+  { at: 3.4, type: "update", turn: 1, text: "Water the tomatoes every morning, and call the" },
+  { at: 4.2, type: "update", turn: 1, text: "Water the tomatoes every morning, and call the plumber on" },
+];
+/** Sent after stop, before the close: the last words, as an update (Flux may not end the turn). */
+const IDEA_LAST: Step = { at: 0, type: "update", turn: 1, text: "Water the tomatoes every morning, and call the plumber on Friday." };
+const IDEA_LIVE = "New idea. Water the tomatoes every morning, and call the plumber on Friday.";
+type Reason = "cap" | "visitor-limit" | "busy" | "session-limit" | "idle" | "error";
+type LiveMode = {
+  /** The status endpoint: available, unavailable, a 500, or no answer at all. */
+  status: "available" | "unavailable" | 500 | "down";
+  /** The socket: scripted words; "none": not answered, so it fails to open; refused at once; or a fallback in the
+   *  clip's pause after "morning,", once the words before it have come. */
+  socket: "ok" | "none" | { refuse: Reason } | { pause: Reason };
+  steps: Step[];
+  last: Step | null;
+};
+type Connection = { frames: number[]; times: number[]; bytes: number; texts: string[]; fellBackAt?: number };
+
+async function mockLive(ctx, initial: Partial<LiveMode> = {}) {
+  const live = { mode: { status: "unavailable", socket: "ok", steps: IDEA_STEPS, last: IDEA_LAST, ...initial } as LiveMode, statusCalls: 0, connections: [] as Connection[] };
+  await ctx.route((u: URL) => u.pathname === "/api/listen/status", async (route) => {
+    live.statusCalls++;
+    const st = live.mode.status;
+    if (st === "down") return route.abort("failed");
+    if (st === 500) return route.fulfill({ status: 500, contentType: "text/plain", body: "Stand-in error" });
+    return route.fulfill({ contentType: "application/json", headers: { "cache-control": "no-store" }, body: JSON.stringify({ available: st === "available" }) });
+  });
+  await ctx.routeWebSocket((u: URL) => u.pathname === "/api/listen", (ws) => {
+    const mode = live.mode;
+    // Not answered here: on to the local preview server, which has no WebSocket, so the socket never opens.
+    if (mode.socket === "none") return void ws.connectToServer();
+    const conn: Connection = { frames: [], times: [], bytes: 0, texts: [] };
+    live.connections.push(conn);
+    const say = (m: object) => ws.send(JSON.stringify(m));
+    const sock = mode.socket;
+    if (typeof sock === "object" && "refuse" in sock) {
+      say({ type: "fallback", reason: sock.refuse });
+      return ws.close({ code: 1000, reason: "fallback" });
+    }
+    const steps = [...mode.steps];
+    let ended = false;
+    // For the fallback in the pause: 20 ms blocks of speech heard so far, and the quiet run now.
+    let speech = 0, quiet = 0, block: number[] = [];
+    ws.onMessage((m) => {
+      if (ended) return;
+      if (typeof m === "string") {
+        conn.texts.push(m);
+        if (JSON.parse(m).type !== "stop") return;
+        ended = true;
+        // The last words come after stop, then the close a moment later: the page must wait for it.
+        setTimeout(() => {
+          if (mode.last) say({ type: mode.last.type, turn: mode.last.turn, text: mode.last.text });
+          setTimeout(() => ws.close({ code: 1000, reason: "done" }), 400);
+        }, 300);
+        return;
+      }
+      conn.frames.push(m.length);
+      conn.times.push(Date.now());
+      conn.bytes += m.length;
+      const seconds = conn.bytes / 32000;
+      while (steps.length && steps[0].at <= seconds) {
+        const st = steps.shift()!;
+        if (typeof sock === "object" && "pause" in sock && st.at > 2.6) break;
+        say({ type: st.type, turn: st.turn, text: st.text });
+      }
+      if (typeof sock === "object" && "pause" in sock) {
+        for (let i = 0; i + 1 < m.length; i += 2) {
+          block.push(m.readInt16LE(i) / 32768);
+          if (block.length < 320) continue;
+          const rms = Math.sqrt(block.reduce((a, v) => a + v * v, 0) / block.length);
+          block = [];
+          if (rms > 0.02) { speech += 0.02; quiet = 0; } else quiet += 0.02;
+          // After "Water the tomatoes every morning," (about 2.3 s of speech), 0.1 s into the pause.
+          if (speech >= 1.8 && quiet >= 0.1) {
+            ended = true;
+            conn.fellBackAt = Math.round((seconds - (m.length - i) / 32000 - quiet / 2) * 16000) / 16000;
+            say({ type: "update", turn: 1, text: "Water the tomatoes every morning," });
+            say({ type: "fallback", reason: sock.pause, seconds: conn.fellBackAt });
+            return ws.close({ code: 1000, reason: "fallback" });
+          }
+        }
+      }
+    });
+  });
+  return live;
+}
+
+/** The frames a connection got are the page's microphone at 16 kHz in 80 ms frames, sent as it records, silence included. */
+function streamedWell(label: string, conn: Connection, seconds: number) {
+  assert.ok(conn.frames.length > 10, `${label}: only ${conn.frames.length} frames`);
+  assert.ok(conn.frames.slice(0, -1).every((n) => n === 2560), `${label}: frames of ${[...new Set(conn.frames)].join(", ")} bytes, not 80 ms of 16-bit audio at 16 kHz`);
+  assert.ok(conn.frames.at(-1)! <= 2560 && conn.frames.at(-1)! % 2 === 0, `${label}: last frame ${conn.frames.at(-1)}`);
+  const sent = conn.bytes / 32000;
+  assert.ok(Math.abs(sent - seconds) < 0.3, `${label}: ${sent.toFixed(2)} s of audio sent for a ${seconds.toFixed(2)} s recording`);
+  // Steadily, quiet or not: never a gap long enough for the server to call it idle, or to mean silence was held back.
+  const gaps = conn.times.slice(1).map((t, i) => t - conn.times[i]);
+  assert.ok(Math.max(...gaps) < 600, `${label}: a ${Math.max(...gaps)} ms gap between frames`);
+  assert.deepEqual(conn.texts, ['{"type":"stop"}'], `${label}: ${conn.texts.join(", ")}`);
+}
+
+async function openPage(name: string, opts, { likes = "ok" as "ok" | "down", init = null as null | (() => void), quiet = null as null | RegExp, refused = [] as string[], mic = null as null | { b64: string; snr?: number }, live = {} as Partial<LiveMode> } = {}) {
   const ctx = await browser.newContext({ ...opts, permissions: ["clipboard-read", "clipboard-write", "microphone"] });
   await mockLikes(ctx, likes);
   const gh = await mockGitHub(ctx, own);
+  const server = await mockLive(ctx, live);
   ctx.on("requestfailed", (r) => {
     if (refused.includes(r.url()) && !/BLOCKED_BY_CSP|csp/i.test(r.failure()?.errorText ?? "")) fail(`${name}: ${r.url()} failed, but not by the policy: ${r.failure()?.errorText}`);
   });
@@ -281,7 +397,7 @@ async function openPage(name: string, opts, { likes = "ok" as "ok" | "down", ini
   });
   page.on("pageerror", (e) => fail(`${name}: page error: ${e.message}`));
   await page.goto(base, { waitUntil: "load" });
-  return { ctx, page, seen, gh };
+  return { ctx, page, seen, gh, server };
 }
 
 const state = (page) => page.evaluate(() => window.__sayfold.state());
@@ -609,6 +725,179 @@ await check("phone", async () => {
   await ctx.close();
 });
 
+// --- live text (lab#109): words while you talk, streamed to a stand-in for Sayfold's Worker ---------------------
+const PROMISE_LIVE = "What you say is sent to Sayfold's server to be turned into text, and isn't kept. Your words go to your own GitHub repo only when you press Send.";
+const PROMISE_OFF = "Live text is off right now, so speech is turned into text on this device and stays on it. Your words go to your own GitHub repo only when you press Send.";
+const liveState = (page) => page.evaluate(() => window.__sayfold.live());
+const promiseText = (page) => page.evaluate(() => document.querySelector("#promise").textContent.trim());
+
+for (const [size, viewport, mobile, scheme] of [["desktop", { width: 1280, height: 900 }, false, "dark"], ["phone", { width: 390, height: 844 }, true, "light"]] as const) {
+  await check(`live, ${size}`, async () => {
+    const label = `live, ${size}`;
+    const { ctx, page, seen, gh, server } = await openPage(label, { viewport, isMobile: mobile, hasTouch: mobile, colorScheme: scheme, ...(mobile && { deviceScaleFactor: 2 }) }, { live: { status: "available" } });
+    const press = (sel: string) => (mobile ? page.locator(sel).tap() : page.locator(sel).click());
+    // Before recording, one plain sentence says what happens to what you say.
+    await page.waitForFunction(() => window.__sayfold.live().on === true, null, { timeout: 5000 });
+    assert.equal(await promiseText(page), PROMISE_LIVE);
+    assert.equal(await page.isVisible("#promise"), true);
+    assert.match(await page.getAttribute("#rec", "aria-describedby"), /\bpromise\b/);
+    assert.equal(await page.isVisible("#live"), false, "the live text shows before recording");
+    const meta = await page.evaluate(() => [...document.querySelectorAll("meta[name=description], meta[property='og:description'], .gh-intro")].map((m) => m.getAttribute("content") ?? m.textContent).join(" "));
+    assert.doesNotMatch(meta, /never leaves|no server|on your device|in your browser/i, meta);
+
+    await press("#rec");
+    await waitState(page, ["recording"], 10000);
+    assert.equal(await page.isVisible("#live"), true, "no live text while recording");
+    assert.equal(await page.isVisible("#live-note"), false);
+    // The words show while you talk: the ended turn, then the turn being spoken, a shade lighter.
+    await page.waitForFunction(() => /tomatoes/.test(document.querySelector("#live-text").textContent), null, { timeout: 8000 });
+    assert.equal(await state(page), "recording");
+    assert.match(await page.textContent("#live-text"), /^New idea\. Water the tomatoes/);
+    assert.match(await page.textContent("#live-text .live-now"), /^ Water the tomatoes/, "the turn being spoken isn't marked as such");
+    await noSideScroll(page, `${label} recording`);
+    await shots(page, `${size}-recording-live`);
+    await page.emulateMedia({ colorScheme: scheme });
+    await page.waitForTimeout(5500 - 2000);
+    await press("#rec");
+    const t0 = Date.now();
+    await waitState(page, ["review", "problem"], 15000);
+    const stopMs = Date.now() - t0;
+    assert.equal(await state(page), "review", await page.textContent("#problem-title"));
+    // Stop waited for the close: the last words came after stop, as an update, and are in the text.
+    assert.ok(stopMs >= 650, `review after ${stopMs} ms, before the server closed`);
+    assert.equal(await page.inputValue("#text"), IDEA_LIVE);
+    assert.equal(await page.inputValue("#title"), "New idea");
+    assert.equal(await page.isVisible("#missing"), false);
+    const st = await liveState(page);
+    assert.deepEqual([st.by, st.reason, st.localSeconds], ["server", null, null]);
+    streamedWell(label, server.connections[0], await page.evaluate(() => window.__sayfold.seconds()));
+    assert.equal(server.connections.length, 1);
+    // The live path never fetches the in-browser model.
+    assert.equal(modelRequests(seen).length, 0, `the live path fetched ${modelRequests(seen).map((r) => r.url).join(", ")}`);
+    await noSideScroll(page, `${label} review`);
+    await shots(page, `${size}-review-live`);
+    await page.emulateMedia({ colorScheme: scheme });
+
+    // The review works as before: the title follows the text, a spoken list becomes a task list, Copy and Send.
+    await page.fill("#text", `${IDEA_LIVE} List, milk, bread, eggs, and list.`);
+    assert.deepEqual(await page.$$eval("#preview li", (els) => els.map((e) => e.textContent)), ["Milk", "Bread", "Eggs"]);
+    await page.fill("#text", IDEA_LIVE);
+    await page.evaluate(() => document.querySelector("#toast").classList.remove("show"));
+    await press("#copy");
+    await page.waitForFunction(() => document.querySelector("#toast").classList.contains("show"));
+    assert.equal(await page.evaluate(() => navigator.clipboard.readText()), `New idea\n\n${IDEA_LIVE}`);
+    await press("#send");
+    await page.fill("#gh-repo", REPO);
+    await page.fill("#gh-token", TOKEN);
+    await press("#gh-connect");
+    await page.waitForFunction(() => !document.querySelector<HTMLDialogElement>("#gh").open, null, { timeout: 5000 });
+    await press("#send");
+    await waitState(page, ["sent"], 5000);
+    assert.deepEqual(gh.issues, [{ title: "New idea", body: IDEA_LIVE, labels: ["idea"] }]);
+    tokenOnlyToGitHub(label, seen);
+
+    // Record the next idea: live again, a new connection, and still no model.
+    await press("#next");
+    await waitState(page, ["recording"], 10000);
+    await page.waitForTimeout(3000);
+    await press("#rec");
+    await waitState(page, ["review", "problem"], 15000);
+    assert.equal(await state(page), "review");
+    assert.equal(server.connections.length, 2);
+    assert.equal(modelRequests(seen).length, 0);
+    console.log(`${label}: "${IDEA_LIVE}" live, ${server.connections[0].frames.length} frames, review ${stopMs} ms after Stop`);
+    await ctx.close();
+  });
+}
+
+// --- live text falls back part way: the words so far stay, and only the rest goes to the in-browser model ---------
+await check("live fallback, part way", async () => {
+  const { ctx, page, seen, server } = await openPage("live fallback, part way", { viewport: { width: 1280, height: 900 }, colorScheme: "light" }, {
+    live: { status: "available", socket: { pause: "visitor-limit" } },
+  });
+  await page.waitForFunction(() => window.__sayfold.live().on === true, null, { timeout: 5000 });
+  await page.locator("#rec").click();
+  await waitState(page, ["recording"], 10000);
+  await page.waitForSelector("#live-note:not([hidden])", { timeout: 8000 });
+  assert.equal(await page.textContent("#live-note"), "You've used your live text for today, so the rest is turned into text on this device.");
+  assert.match(await page.textContent("#live-text"), /^New idea\. Water the tomatoes every morning,$/);
+  assert.equal(await state(page), "recording", "recording stopped at the fallback");
+  // Part of this recording was sent, so the line under the button keeps saying so until it ends.
+  assert.equal(await promiseText(page), PROMISE_LIVE, "the line changed while a partly sent recording was still going");
+  // The in-browser model starts loading at once, while the visitor is still talking.
+  await page.waitForFunction(() => performance.getEntriesByType("resource").some((e) => /\/models\//.test(e.name)), null, { timeout: 5000 }).catch(() => {
+    if (!seen.some((r) => r.url.includes("/models/"))) throw new Error("the in-browser model didn't start loading at the fallback");
+  });
+  await shot(page, "desktop-recording-live-fallback-light");
+  await page.waitForTimeout(5500 - 3000);
+  await page.locator("#rec").click();
+  await waitState(page, ["review", "problem"], 180000);
+  assert.equal(await state(page), "review", await page.textContent("#problem-title"));
+  const text = await page.inputValue("#text");
+  const at = server.connections[0].fellBackAt!;
+  const st = await liveState(page);
+  const seconds = await page.evaluate(() => window.__sayfold.seconds());
+  assert.equal(st.reason, "visitor-limit");
+  assert.ok(Math.abs(st.from - at) < 1e-6, `the in-browser model took over at ${st.from} s, not where the server stopped (${at} s)`);
+  assert.ok(Math.abs(st.localSeconds - (seconds - at)) < 0.01, `the in-browser model got ${st.localSeconds} s, not the ${(seconds - at).toFixed(2)} s after the fallback`);
+  assert.ok(at > 2.3 && at < 3, `the stand-in fell back at ${at} s, outside the pause`);
+  assert.ok(text.startsWith("New idea. Water the tomatoes every morning, and "), `the text so far wasn't kept, or isn't joined mid-sentence: "${text}"`);
+  for (const w of ["plumber", "friday"]) assert.ok(text.toLowerCase().includes(w), `"${w}" missing from "${text}"`);
+  for (const w of ["tomatoes", "plumber", "new idea"]) assert.equal(text.toLowerCase().split(w).length - 1, 1, `"${w}" isn't there exactly once in "${text}"`);
+  assert.ok(st.by === "webgpu" || st.by === "wasm", st.by);
+  // After visitor-limit, the page says live text is off before the next recording.
+  assert.equal(await promiseText(page), PROMISE_OFF);
+  console.log(`live fallback, part way: "${text}" (the in-browser model from ${at.toFixed(2)} s of ${seconds.toFixed(2)} s)`);
+  await ctx.close();
+});
+
+// --- live text can't be used: every way ends in a transcript from the in-browser model --------------------------
+await check("live fallback, every reason", async () => {
+  const { ctx, page, server } = await openPage("live fallback, every reason", { viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, colorScheme: "light" }, {
+    live: { status: "available" },
+    // The status's 500 and "down" cases, and the socket that won't open, are logged by the browser itself.
+    quiet: /WebSocket connection to .* failed|status of 500|net::ERR_FAILED/,
+  });
+  type Case = [string, Partial<LiveMode>, string | null];
+  const cases: Case[] = [
+    ...(["busy", "session-limit", "idle", "error", "cap", "visitor-limit"] as const).map((r): Case => [r, { status: "available", socket: { refuse: r } }, r]),
+    ["socket won't open", { status: "available", socket: "none" }, "error"],
+    ["status unavailable", { status: "unavailable", socket: "ok" }, null],
+    ["status error", { status: 500, socket: "ok" }, null],
+    ["status down", { status: "down", socket: "ok" }, null],
+  ];
+  for (const [label, mode, reason] of cases) {
+    Object.assign(server.mode, mode);
+    const before = server.connections.length;
+    await page.reload({ waitUntil: "load" });
+    await page.waitForFunction(() => window.__sayfold.live().on !== null, null, { timeout: 5000 });
+    assert.equal(await promiseText(page), reason === null ? PROMISE_OFF : PROMISE_LIVE, `${label}: before recording`);
+    await page.locator("#rec").tap();
+    await waitState(page, ["recording"], 10000);
+    if (reason) {
+      await page.waitForSelector("#live-note:not([hidden])", { timeout: 8000 });
+      const note = await page.textContent("#live-note");
+      assert.match(note, /, so it's turned into text on this device\.$/, `${label}: ${note}`);
+      if (reason === "busy") await shot(page, "phone-recording-live-busy-light");
+    } else assert.equal(await page.isVisible("#live"), false, `${label}: live text shows though it's off`);
+    await page.waitForTimeout(5500);
+    await page.locator("#rec").tap();
+    await waitState(page, ["review", "problem"], 180000);
+    assert.equal(await state(page), "review", `${label}: ${await page.textContent("#problem-title")}`);
+    const text = (await page.inputValue("#text")).toLowerCase();
+    for (const w of EXPECTED_WORDS) assert.ok(text.includes(w), `${label}: "${w}" missing from "${text}"`);
+    const st = await liveState(page);
+    assert.equal(st.reason, reason, label);
+    assert.ok(st.by === "webgpu" || st.by === "wasm", `${label}: ${st.by}`);
+    const seconds = await page.evaluate(() => window.__sayfold.seconds());
+    assert.ok(Math.abs(st.localSeconds - seconds) < 0.01, `${label}: the in-browser model got ${st.localSeconds} of ${seconds} s`);
+    assert.equal(server.connections.length - before, reason && label !== "socket won't open" ? 1 : 0, `${label}: connections`);
+    if (reason === "cap" || reason === "visitor-limit") assert.equal(await promiseText(page), PROMISE_OFF, `${label}: after the recording`);
+    console.log(`live fallback, ${label}: "${await page.inputValue("#text")}"`);
+  }
+  await ctx.close();
+});
+
 // --- the page's Content-Security-Policy -------------------------------------------------------------
 await check("content security policy", async () => {
   const { ctx, page } = await openPage("content security policy", { viewport: { width: 1280, height: 900 } }, {
@@ -617,7 +906,7 @@ await check("content security policy", async () => {
   });
   const csp = await page.getAttribute('meta[http-equiv="Content-Security-Policy"]', "content");
   assert.ok(csp, "no Content-Security-Policy in the built page");
-  assert.match(csp, /(^|; )connect-src 'self' https:\/\/api\.github\.com https:\/\/lab\.brightloopapps\.com https:\/\/eu\.i\.posthog\.com(;|$)/, csp);
+  assert.match(csp, /(^|; )connect-src 'self' wss:\/\/sayfold\.brightloopapps\.com wss:\/\/sayfold\.erko-erka1\.workers\.dev https:\/\/api\.github\.com https:\/\/lab\.brightloopapps\.com https:\/\/eu\.i\.posthog\.com(;|$)/, csp);
   // A request anywhere else is refused by the browser itself.
   const refused = await page.evaluate(() => new Promise<string>((done) => {
     addEventListener("securitypolicyviolation", (e) => done(`${e.violatedDirective} ${e.blockedURI}`), { once: true });
@@ -1070,6 +1359,8 @@ async function analytics(dnt: boolean) {
     await route.fulfill({ status: 200, contentType: "application/json", body: '{"status":"Ok"}' });
   });
   const gh = await mockGitHub(ctx, site);
+  // Live text with Do Not Track off, so its transcript's event is counted too; the in-browser model with it on.
+  await mockLive(ctx, { status: dnt ? "unavailable" : "available" });
   ctx.on("request", (q) => {
     const u = new URL(q.url());
     if (u.protocol.startsWith("http")) r.hosts.add(u.hostname);
@@ -1081,7 +1372,8 @@ async function analytics(dnt: boolean) {
   await check(label, async () => {
     await record(page, label, 5.5, () => page.locator("#rec").click());
     assert.equal(await state(page), "review", await page.textContent("#problem-title"));
-    const backend = await page.evaluate(() => window.__sayfold.backend());
+    const backend = await page.evaluate(() => window.__sayfold.live().by);
+    if (!dnt) assert.equal(backend, "server", "live text didn't make the transcript");
     // Connect and send it to GitHub's stand-in, with the `later` label too.
     await page.locator("#send").click();
     await page.fill("#gh-repo", REPO);

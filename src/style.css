@@ -152,6 +152,40 @@ body {
 }
 .clock-cap { color: var(--ink-dim); font-size: 1.1rem; font-weight: 500; }
 
+/* Live text: the note taking shape while you talk. The newest words sit at the bottom, and older lines
+   slide up under a fade. The turn still being spoken is a shade lighter until it ends. */
+.live {
+  position: relative;
+  display: none;
+  flex-direction: column;
+  gap: 0.4rem;
+  width: 100%;
+  max-width: 440px;
+  padding: 0.7rem 1rem 0.75rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius) 0 var(--radius) var(--radius);
+  background: var(--card);
+  text-align: left;
+}
+[data-live="on"][data-state="recording"] .live,
+[data-live="on"][data-state="working"] .live { display: flex; }
+.live-scroll {
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  height: calc(1.55em * 3);
+  overflow: hidden;
+  font: 1.02rem/1.55 var(--font-body);
+  -webkit-mask-image: linear-gradient(to bottom, transparent, #000 1.1em);
+  mask-image: linear-gradient(to bottom, transparent, #000 1.1em);
+}
+.live-text { margin: 0; color: var(--ink); overflow-wrap: anywhere; }
+.live-text:empty::before { content: attr(data-hint); color: var(--ink-dim); }
+.live-now { color: var(--ink-dim); }
+.live-note { margin: 0; padding-top: 0.4rem; border-top: 1px solid var(--line); color: var(--ink-dim); font-size: 0.86rem; }
+/* While the text is finished, the work note says the same. */
+[data-state="working"] .live-note { display: none; }
+
 /* The record button: a big warm disc with a dot, which turns into a square to stop. A soft ring breathes with your voice. */
 .rec {
   --level: 0;
@@ -336,6 +370,7 @@ a:focus-visible { outline: 2.5px solid var(--focus); outline-offset: 3px; }
 }
 /* The folded corner. */
 .note::after,
+.live::after,
 .sent-card::after {
   content: "";
   position: absolute;

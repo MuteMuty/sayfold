@@ -58,3 +58,26 @@ export function parseClientMessage(data: string): ClientMessage | null {
     return null;
   }
 }
+
+const REASONS: readonly FallbackReason[] = ["cap", "visitor-limit", "busy", "session-limit", "idle", "error"];
+
+/** A text frame from the server, or null when it isn't one the protocol knows. */
+export function parseServerMessage(data: unknown): ServerMessage | null {
+  if (typeof data !== "string") return null;
+  let m: { type?: unknown; turn?: unknown; text?: unknown; reason?: unknown; seconds?: unknown };
+  try {
+    m = JSON.parse(data);
+  } catch {
+    return null;
+  }
+  if (typeof m !== "object" || m === null) return null;
+  if ((m.type === "update" || m.type === "end-of-turn") && Number.isInteger(m.turn) && typeof m.text === "string") {
+    return { type: m.type, turn: m.turn as number, text: m.text };
+  }
+  if (m.type === "fallback" && REASONS.includes(m.reason as FallbackReason)) {
+    const reason = m.reason as FallbackReason;
+    if (m.seconds === undefined) return { type: "fallback", reason };
+    return typeof m.seconds === "number" && m.seconds >= 0 && Number.isFinite(m.seconds) ? { type: "fallback", reason, seconds: m.seconds } : null;
+  }
+  return null;
+}

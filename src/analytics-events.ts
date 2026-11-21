@@ -1,7 +1,8 @@
 // Sayfold's usage events: the only ones it may send (lab SAFETY.md, "Usage events", lab#71), following
 // the lab-wide convention: `$pageview`, then `play_started` when a recording starts and `play_finished`
 // when its transcript is ready to review. The finish carries only how long the recording was, in
-// buckets, and which backend turned it into text. `idea_sent` says an idea went to GitHub as an issue,
+// buckets, and what turned it into text: `server` when live text did all of it (lab#109), otherwise the
+// in-browser model's backend. `idea_sent` says an idea went to GitHub as an issue,
 // and nothing else: never the repo, the token, the labels, or whether a token is remembered. Nothing
 // anyone said or typed is ever sent: no audio, transcript, title, word counts or anything else taken from them.
 // Adding an event or value here is a normal commit; anything new in kind needs Erik.
@@ -9,7 +10,10 @@ import type { AllowList, Props } from "./analytics.ts";
 
 export const PROJECT = "sayfold";
 
+/** Where the in-browser model runs. */
 export type Backend = "webgpu" | "wasm";
+/** What turned a recording into text: live text on Sayfold's server, or the in-browser model. */
+export type Finisher = Backend | "server";
 
 /** Lower bounds in seconds; the labels use the hub's bucket format (guard.ts `bucket`). */
 const EDGES = [0, 10, 30, 60, 120] as const;
@@ -18,7 +22,7 @@ const SECONDS = ["0-9", "10-29", "30-59", "60-119", "120+"];
 export const EVENTS = {
   $pageview: {},
   play_started: {},
-  play_finished: { seconds_bucket: SECONDS, backend: ["webgpu", "wasm"] },
+  play_finished: { seconds_bucket: SECONDS, backend: ["webgpu", "wasm", "server"] },
   idea_sent: {},
 } satisfies AllowList;
 
@@ -39,7 +43,7 @@ export function playEvents(send: (name: string, props: Props) => void) {
       open = true;
       safe("play_started", {});
     },
-    finished(seconds: number, backend: Backend) {
+    finished(seconds: number, backend: Finisher) {
       if (!open) return;
       open = false;
       safe("play_finished", { seconds_bucket: secondsBucket(seconds), backend });

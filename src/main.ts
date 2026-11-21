@@ -9,7 +9,9 @@ import { LoadProgress, megabytes } from "./core/progress.ts";
 import { MODEL } from "./stt/model.ts";
 import { Likes, likeLabel, shortCount } from "./core/likes.ts";
 import { loadAnalytics, track } from "./analytics.ts";
-import { EVENTS, playEvents, PROJECT, type Backend } from "./analytics-events.ts";
+import { EVENTS, playEvents, PROJECT, type Backend, type Finisher } from "./analytics-events.ts";
+import { LiveSession, fallbackNote, joinText, listenUrl, liveStatus, type LiveEnd, type Part, type SocketLike } from "./core/live.ts";
+import { StreamResampler } from "./core/resample.ts";
 import { connect, send, issueFrom, parseRepo, preselected, repoName, sendButton, tokenProblem, type GitHubProblem, type Label } from "./core/github.ts";
 import { GitHubLink } from "./core/token.ts";
 
@@ -129,8 +131,71 @@ const speech = new Speech({
 
 function showTranscribing(note = "") {
   workLabel.textContent = "Turning speech into text";
-  workNote.textContent = note || "On this device. Nothing is uploaded.";
+  workNote.textContent = note || onDevice();
   if (!note) document.body.dataset.bar = "busy";
+}
+
+/** Where the in-browser model is turning this recording into text, and why. */
+function onDevice(): string {
+  const end = liveEnd;
+  return end?.reason ? fallbackNote(end.reason, (end.from ?? 0) > 0) : "On this device. This recording stays here.";
+}
+
+// --- live text (lab#109) -----------------------------------------------------------------------
+// When Sayfold's server takes recordings, the microphone streams to it and the words show while the visitor
+// talks (core/live.ts). Whenever it can't be used, the in-browser model does the work, from where the live
+// text stopped. The model is fetched only then: a live recording never waits for its 45 MB, and a recording
+// that falls back part way starts loading it at once, while the visitor is still talking.
+const promise = $("#promise");
+const liveTextEl = $("#live-text");
+const liveNote = $("#live-note");
+/** Whether the server takes recordings: null until the status answers (at most 3 s after the page loads). */
+let liveOn: boolean | null = null;
+const statusCheck = liveStatus((...a) => fetch(...a)).then((ok) => {
+  liveOn = ok;
+  renderPromise();
+  return ok;
+});
+let session: LiveSession | null = null;
+let resampler: StreamResampler | null = null;
+/** How the last recording's live text ended (null when it had none). */
+let liveEnd: LiveEnd | null = null;
+/** Seconds of the last recording given to the in-browser model, for the playtest. */
+let localSeconds: number | null = null;
+let finishedBy: Finisher | null = null;
+/** A recording the in-browser model takes over with less than this left needs no model: no word fits in it. */
+const MIN_REST = 0.3;
+
+/** What happens to what you say, said before you record. */
+function renderPromise() {
+  promise.textContent = liveOn === false
+    ? "Live text is off right now, so speech is turned into text on this device and stays on it. Your words go to your own GitHub repo only when you press Send."
+    : "What you say is sent to Sayfold's server to be turned into text, and isn't kept. Your words go to your own GitHub repo only when you press Send.";
+}
+
+function renderLive(parts: Part[]) {
+  liveTextEl.replaceChildren(
+    ...parts.map((p, i) => Object.assign(document.createElement("span"), { textContent: (i ? " " : "") + p.text, className: p.done ? "" : "live-now" })),
+  );
+}
+
+function openLive() {
+  const s = new LiveSession(() => new WebSocket(listenUrl(location)) as unknown as SocketLike, {
+    text: (parts) => {
+      if (session === s) renderLive(parts);
+    },
+    fallback(end) {
+      // The in-browser model will be needed: start fetching it now.
+      speech.load();
+      // Off for the next recordings; the line under the button changes once this one ends, as part of it was sent.
+      if (end.reason === "cap" || end.reason === "visitor-limit") liveOn = false;
+      if (session === s) {
+        liveNote.textContent = fallbackNote(end.reason!, (end.from ?? 0) > 0);
+        liveNote.hidden = false;
+      }
+    },
+  });
+  return s;
 }
 
 // --- recording -------------------------------------------------------------------------------
@@ -147,15 +212,36 @@ async function start() {
   if (previous) void previous.stop();
   setState("starting");
   say("Asking for the microphone");
-  // First use: the model starts loading now, while you talk.
-  speech.load();
+  resampler = null;
+  /** Audio from before live text is decided on (usually none: the status answers long before anyone records). */
+  let early: Float32Array[] | null = [];
   try {
-    recorder = await Recorder.start(() => void stop(true));
+    // The microphone first, while the press still counts as one for audio.
+    recorder = await Recorder.start(() => void stop(true), (mono, rate) => {
+      resampler ??= new StreamResampler(rate);
+      const pcm = resampler.push(mono);
+      if (session) session.push(pcm);
+      else early?.push(pcm);
+    });
   } catch (e) {
     recorder = null;
     showProblem(micProblem(e));
     return;
   }
+  // Live text, or the in-browser model. The socket opens once the microphone is on, so a permission prompt
+  // doesn't hold it open.
+  const live = (await statusCheck) && liveOn !== false;
+  liveEnd = null;
+  localSeconds = null;
+  finishedBy = null;
+  renderLive([]);
+  liveNote.hidden = true;
+  document.body.dataset.live = live ? "on" : "off";
+  session = live ? openLive() : null;
+  for (const pcm of early) session?.push(pcm);
+  early = null;
+  // First use of the in-browser model: it starts loading now, while you talk.
+  if (!live) speech.load();
   last = null;
   levels = [];
   plays.started();
@@ -170,36 +256,61 @@ async function stop(capped = false) {
   if (state !== "recording" || !recorder) return;
   const r = recorder;
   recorder = null;
+  const s = session;
   setState("working");
+  if (s) {
+    workLabel.textContent = "Finishing the text";
+    workNote.textContent = "";
+    document.body.dataset.bar = "busy";
+  }
   last = await r.stop();
   // The last frame drawn may have been just before the cap: end on the recording's real length (2:00 at the cap).
   clockNow.textContent = clock(last.seconds);
   if (capped) toast(`Stopped at ${clock(MAX_SECONDS)}, the limit for one recording.`);
+  if (s) {
+    if (resampler) s.push(resampler.flush());
+    // Stop, then the server's last words and its close.
+    liveEnd = await s.finish();
+    session = null;
+    renderPromise();
+  }
   await transcribe();
 }
 
 async function transcribe() {
   if (!last) return;
+  const rec = last;
+  // The live text so far, and the second from which the in-browser model takes over (all of it without live text).
+  const heard = liveEnd?.text ?? "";
+  const from = liveEnd ? liveEnd.from : 0;
+  if (from === null || rec.seconds - from < MIN_REST) return finish(rec, heard, "server", false);
   setState("working");
   if (speech.ready) showTranscribing();
   else showLoad();
   say(speech.ready ? "Turning speech into text" : "Getting the speech model ready");
-  const rec = last;
   try {
-    const result = await speech.transcribe(rec.samples, rec.rate);
+    // Only what the live text didn't cover, copied: the page keeps the recording so Try again needs no new one.
+    const rest = rec.samples.slice(Math.round(from * rec.rate));
+    localSeconds = rest.length / rec.rate;
+    const result = await speech.transcribe(rest, rec.rate);
     backend = result.backend;
-    if (!result.text.trim()) {
-      plays.abandoned();
-      showProblem("empty");
-      return;
-    }
-    plays.finished(rec.seconds, result.backend);
-    showReview(result.text.trim(), result.gaps);
+    finish(rec, joinText(heard, result.text), result.backend, result.gaps);
   } catch (e) {
     console.warn("Sayfold: transcription failed:", e);
     // The recording stays, so Try again doesn't need a new one.
     showProblem((e as { stage?: string }).stage === "load" ? "model" : "transcribe");
   }
+}
+
+function finish(rec: Recording, text: string, by: Finisher, gaps: boolean) {
+  if (!text.trim()) {
+    plays.abandoned();
+    showProblem("empty");
+    return;
+  }
+  finishedBy = by;
+  plays.finished(rec.seconds, by);
+  showReview(text.trim(), gaps);
 }
 
 // --- review ----------------------------------------------------------------------------------
@@ -633,7 +744,12 @@ loadAnalytics(PROJECT, EVENTS);
 
 // A read-only look inside for the playtest: the page's state, never anything recorded.
 declare global {
-  interface Window { __sayfold?: { state(): State; backend(): Backend | null; seconds(): number | null; modelReady(): boolean; connected(): boolean } }
+  interface Window {
+    __sayfold?: {
+      state(): State; backend(): Backend | null; seconds(): number | null; modelReady(): boolean; connected(): boolean;
+      live(): { on: boolean | null; reason: string | null; from: number | null; localSeconds: number | null; by: Finisher | null };
+    };
+  }
 }
 window.__sayfold = {
   state: () => state,
@@ -641,4 +757,5 @@ window.__sayfold = {
   seconds: () => last?.seconds ?? null,
   modelReady: () => speech.ready,
   connected: () => link.current !== null,
+  live: () => ({ on: liveOn, reason: liveEnd?.reason ?? null, from: liveEnd?.from ?? null, localSeconds, by: finishedBy }),
 };

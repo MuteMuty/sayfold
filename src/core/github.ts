@@ -1,6 +1,6 @@
 // Sending an idea to the visitor's own GitHub repo as an issue. GitHub is the API: each person uses their
 // own fine-grained token, limited to one repo, and everything goes straight from the browser to
-// api.github.com. Sayfold has no server. Plain logic: the page hands in fetch, so `node --test` can run it.
+// api.github.com, never through Sayfold's server. Plain logic: the page hands in fetch, so `node --test` can run it.
 import { titleFrom } from "./title.ts";
 import { bodyFrom } from "./list.ts";
 
