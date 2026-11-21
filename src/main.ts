@@ -10,7 +10,7 @@ import { MODEL } from "./stt/model.ts";
 import { Likes, likeLabel, shortCount } from "./core/likes.ts";
 import { loadAnalytics, track } from "./analytics.ts";
 import { EVENTS, playEvents, PROJECT, type Backend, type Finisher } from "./analytics-events.ts";
-import { LiveSession, fallbackNote, joinText, listenUrl, liveStatus, type LiveEnd, type Part, type SocketLike } from "./core/live.ts";
+import { LiveSession, fallbackNote, joinText, listenUrl, liveStatus, promiseLine, type LiveEnd, type Part, type SocketLike } from "./core/live.ts";
 import { StreamResampler } from "./core/resample.ts";
 import { connect, send, issueFrom, parseRepo, preselected, repoName, sendButton, tokenProblem, type GitHubProblem, type Label } from "./core/github.ts";
 import { GitHubLink } from "./core/token.ts";
@@ -160,6 +160,8 @@ let session: LiveSession | null = null;
 let resampler: StreamResampler | null = null;
 /** How the last recording's live text ended (null when it had none). */
 let liveEnd: LiveEnd | null = null;
+/** Whether audio of the recording on screen went to the server: until the next one starts, the line says so. */
+let liveSent = false;
 /** Seconds of the last recording given to the in-browser model, for the playtest. */
 let localSeconds: number | null = null;
 let finishedBy: Finisher | null = null;
@@ -168,9 +170,7 @@ const MIN_REST = 0.3;
 
 /** What happens to what you say, said before you record. */
 function renderPromise() {
-  promise.textContent = liveOn === false
-    ? "Live text is off right now, so speech is turned into text on this device and stays on it. Your words go to your own GitHub repo only when you press Send."
-    : "What you say is sent to Sayfold's server to be turned into text, and isn't kept. Your words go to your own GitHub repo only when you press Send.";
+  promise.textContent = promiseLine(liveOn, liveSent);
 }
 
 function renderLive(parts: Part[]) {
@@ -187,7 +187,7 @@ function openLive() {
     fallback(end) {
       // The in-browser model will be needed: start fetching it now.
       speech.load();
-      // Off for the next recordings; the line under the button changes once this one ends, as part of it was sent.
+      // Off for the next recordings. The line under the button changes once this one ends, and says part of it was sent.
       if (end.reason === "cap" || end.reason === "visitor-limit") liveOn = false;
       if (session === s) {
         liveNote.textContent = fallbackNote(end.reason!, (end.from ?? 0) > 0);
@@ -232,6 +232,9 @@ async function start() {
   // doesn't hold it open.
   const live = (await statusCheck) && liveOn !== false;
   liveEnd = null;
+  // A new recording: the line is about this one now, which stays on this device unless it's live.
+  liveSent = false;
+  renderPromise();
   localSeconds = null;
   finishedBy = null;
   renderLive([]);
@@ -271,6 +274,7 @@ async function stop(capped = false) {
     if (resampler) s.push(resampler.flush());
     // Stop, then the server's last words and its close.
     liveEnd = await s.finish();
+    liveSent = s.sentAudio;
     session = null;
     renderPromise();
   }
@@ -747,7 +751,7 @@ declare global {
   interface Window {
     __sayfold?: {
       state(): State; backend(): Backend | null; seconds(): number | null; modelReady(): boolean; connected(): boolean;
-      live(): { on: boolean | null; reason: string | null; from: number | null; localSeconds: number | null; by: Finisher | null };
+      live(): { on: boolean | null; reason: string | null; from: number | null; sent: boolean; localSeconds: number | null; by: Finisher | null };
     };
   }
 }
@@ -757,5 +761,5 @@ window.__sayfold = {
   seconds: () => last?.seconds ?? null,
   modelReady: () => speech.ready,
   connected: () => link.current !== null,
-  live: () => ({ on: liveOn, reason: liveEnd?.reason ?? null, from: liveEnd?.from ?? null, localSeconds, by: finishedBy }),
+  live: () => ({ on: liveOn, reason: liveEnd?.reason ?? null, from: liveEnd?.from ?? null, sent: liveSent, localSeconds, by: finishedBy }),
 };

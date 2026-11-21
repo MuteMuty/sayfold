@@ -263,13 +263,21 @@ const IDEA_STEPS: Step[] = [
 /** Sent after stop, before the close: the last words, as an update (Flux may not end the turn). */
 const IDEA_LAST: Step = { at: 0, type: "update", turn: 1, text: "Water the tomatoes every morning, and call the plumber on Friday." };
 const IDEA_LIVE = "New idea. Water the tomatoes every morning, and call the plumber on Friday.";
+/** Words that lag the audio, as they can: "Water the" (said by about 1.4 s) comes only at 2.1 s, and then the
+ *  connection goes, at 2.13 s, while "tomatoes every" is being said. */
+const LAGGING_STEPS: Step[] = [
+  { at: 0.6, type: "update", turn: 0, text: "New" },
+  { at: 1.2, type: "end-of-turn", turn: 0, text: "New idea." },
+  { at: 2.1, type: "update", turn: 1, text: "Water the" },
+];
+const DROP_AT = 2.13;
 type Reason = "cap" | "visitor-limit" | "busy" | "session-limit" | "idle" | "error";
 type LiveMode = {
   /** The status endpoint: available, unavailable, a 500, or no answer at all. */
   status: "available" | "unavailable" | 500 | "down";
   /** The socket: scripted words; "none": not answered, so it fails to open; refused at once; or a fallback in the
    *  clip's pause after "morning,", once the words before it have come. */
-  socket: "ok" | "none" | { refuse: Reason } | { pause: Reason };
+  socket: "ok" | "none" | { refuse: Reason } | { pause: Reason } | { drop: "no-close-frame" | Reason };
   steps: Step[];
   last: Step | null;
 };
@@ -321,6 +329,14 @@ async function mockLive(ctx, initial: Partial<LiveMode> = {}) {
         const st = steps.shift()!;
         if (typeof sock === "object" && "pause" in sock && st.at > 2.6) break;
         say({ type: st.type, turn: st.turn, text: st.text });
+      }
+      if (typeof sock === "object" && "drop" in sock && seconds >= DROP_AT) {
+        ended = true;
+        conn.fellBackAt = seconds;
+        // No close frame (as a dropped connection is seen in the browser), or a fallback that doesn't say how much was taken.
+        if (sock.drop === "no-close-frame") return ws.close({ code: 1006, reason: "" });
+        say({ type: "fallback", reason: sock.drop });
+        return ws.close({ code: 1000, reason: "fallback" });
       }
       if (typeof sock === "object" && "pause" in sock) {
         for (let i = 0; i + 1 < m.length; i += 2) {
@@ -728,6 +744,9 @@ await check("phone", async () => {
 // --- live text (lab#109): words while you talk, streamed to a stand-in for Sayfold's Worker ---------------------
 const PROMISE_LIVE = "What you say is sent to Sayfold's server to be turned into text, and isn't kept. Your words go to your own GitHub repo only when you press Send.";
 const PROMISE_OFF = "Live text is off right now, so speech is turned into text on this device and stays on it. Your words go to your own GitHub repo only when you press Send.";
+const PROMISE_SENT_OFF = "Part or all of this recording was sent to Sayfold's server to be turned into text, and isn't kept. Live text is off now, so the next one stays on this device. Your words go to your own GitHub repo only when you press Send.";
+/** The words of a text, without case or punctuation. */
+const wordsOf = (t: string) => t.toLowerCase().replace(/[^a-z0-9' ]/g, " ").split(/\s+/).filter(Boolean);
 const liveState = (page) => page.evaluate(() => window.__sayfold.live());
 const promiseText = (page) => page.evaluate(() => document.querySelector("#promise").textContent.trim());
 
@@ -845,11 +864,59 @@ await check("live fallback, part way", async () => {
   for (const w of ["plumber", "friday"]) assert.ok(text.toLowerCase().includes(w), `"${w}" missing from "${text}"`);
   for (const w of ["tomatoes", "plumber", "new idea"]) assert.equal(text.toLowerCase().split(w).length - 1, 1, `"${w}" isn't there exactly once in "${text}"`);
   assert.ok(st.by === "webgpu" || st.by === "wasm", st.by);
-  // After visitor-limit, the page says live text is off before the next recording.
+  // After visitor-limit, live text is off for the next recording, but this one was partly sent, and its review says so.
+  assert.equal(st.sent, true);
+  assert.equal(await promiseText(page), PROMISE_SENT_OFF, "the review says a partly sent recording stayed on this device");
+  assert.equal(await page.isVisible("#promise"), true);
+  await shot(page, "desktop-review-live-fallback-light");
+  // The next recording really stays on this device: the line says so once it starts, and nothing is sent.
+  const before = server.connections.length;
+  await page.locator("#again").click();
+  await waitState(page, ["recording"], 10000);
+  assert.equal(await promiseText(page), PROMISE_OFF, "the next recording, on this device, isn't said to stay there");
+  assert.equal(await page.isVisible("#live"), false);
+  await page.waitForTimeout(5500);
+  await page.locator("#rec").click();
+  await waitState(page, ["review", "problem"], 180000);
+  assert.equal(await state(page), "review", await page.textContent("#problem-title"));
+  assert.equal(server.connections.length, before, "the recording after visitor-limit was sent");
+  assert.equal((await liveState(page)).sent, false);
   assert.equal(await promiseText(page), PROMISE_OFF);
+  await shot(page, "desktop-review-after-fallback-light");
   console.log(`live fallback, part way: "${text}" (the in-browser model from ${at.toFixed(2)} s of ${seconds.toFixed(2)} s)`);
   await ctx.close();
 });
+
+// --- live text whose words lag the audio, then stop without saying how much was heard: every word, once -----------
+for (const drop of ["no-close-frame", "idle"] as const) {
+  const label = `live drop, ${drop === "no-close-frame" ? "no close frame" : "fallback without seconds"}`;
+  await check(label, async () => {
+    const { ctx, page, server } = await openPage(label, { viewport: { width: 1280, height: 900 }, colorScheme: "light" }, {
+      live: { status: "available", socket: { drop }, steps: LAGGING_STEPS },
+    });
+    await page.waitForFunction(() => window.__sayfold.live().on === true, null, { timeout: 5000 });
+    await page.locator("#rec").click();
+    await waitState(page, ["recording"], 10000);
+    await page.waitForSelector("#live-note:not([hidden])", { timeout: 8000 });
+    assert.equal(await page.textContent("#live-text"), "New idea. Water the");
+    await page.waitForTimeout(5500 - 2500);
+    await page.locator("#rec").click();
+    await waitState(page, ["review", "problem"], 180000);
+    assert.equal(await state(page), "review", await page.textContent("#problem-title"));
+    const text = await page.inputValue("#text");
+    const st = await liveState(page);
+    assert.equal(st.reason, drop === "idle" ? "idle" : "error");
+    const at = server.connections[0].fellBackAt!;
+    assert.ok(st.from > 0.5 && st.from < at - 0.4, `the in-browser model took over at ${st.from} s, too close to the last words' ${at.toFixed(2)} s`);
+    assert.ok(text.startsWith("New idea. Water the tomatoes every morning, and "), `"${text}"`);
+    // Every word said, exactly once, in order.
+    assert.deepEqual(wordsOf(text), wordsOf(IDEA_LIVE), `"${text}"`);
+    // Still live for the next recording, and this one was sent: the line keeps saying so.
+    assert.equal(await promiseText(page), PROMISE_LIVE);
+    console.log(`${label}: "${text}" (the in-browser model from ${st.from.toFixed(2)} s, the last words at ${at.toFixed(2)} s)`);
+    await ctx.close();
+  });
+}
 
 // --- live text can't be used: every way ends in a transcript from the in-browser model --------------------------
 await check("live fallback, every reason", async () => {
@@ -892,7 +959,10 @@ await check("live fallback, every reason", async () => {
     const seconds = await page.evaluate(() => window.__sayfold.seconds());
     assert.ok(Math.abs(st.localSeconds - seconds) < 0.01, `${label}: the in-browser model got ${st.localSeconds} of ${seconds} s`);
     assert.equal(server.connections.length - before, reason && label !== "socket won't open" ? 1 : 0, `${label}: connections`);
-    if (reason === "cap" || reason === "visitor-limit") assert.equal(await promiseText(page), PROMISE_OFF, `${label}: after the recording`);
+    // A refusal at once may come before a whole frame went out; any audio sent, and the line never says it stayed here.
+    if (reason === "cap" || reason === "visitor-limit") assert.equal(await promiseText(page), st.sent ? PROMISE_SENT_OFF : PROMISE_OFF, `${label}: after the recording`);
+    else assert.equal(await promiseText(page), reason ? PROMISE_LIVE : PROMISE_OFF, `${label}: after the recording`);
+    if (!reason || label === "socket won't open") assert.equal(st.sent, false, `${label}: audio was sent`);
     console.log(`live fallback, ${label}: "${await page.inputValue("#text")}"`);
   }
   await ctx.close();

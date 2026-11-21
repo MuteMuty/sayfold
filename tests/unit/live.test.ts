@@ -4,7 +4,7 @@
 import { afterEach, beforeEach, mock, test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  FRAME_SAMPLES, LiveSession, LiveText, OPEN_WAIT_MS, STOP_WAIT_MS, fallbackNote, joinText, liveStatus, toPcm16, type SocketLike,
+  FRAME_SAMPLES, LAG_MARGIN, LiveSession, LiveText, OPEN_WAIT_MS, STOP_WAIT_MS, fallbackNote, joinText, liveStatus, promiseLine, toPcm16, type SocketLike,
 } from "../../src/core/live.ts";
 import { parseServerMessage, type FallbackReason } from "../../src/listen/protocol.ts";
 
@@ -110,6 +110,40 @@ test("joining the live text and the in-browser model's text", () => {
   assert.equal(joinText("Is it done?", "Yes."), "Is it done? Yes.");
   assert.equal(joinText("", "Call the plumber."), "Call the plumber.");
   assert.equal(joinText(" Water. ", ""), "Water.");
+});
+
+test("joining: words the in-browser model heard again where the live text ended show once", () => {
+  // The model starts a little before the last words came (LAG_MARGIN), so its first words may repeat the live text's last.
+  assert.equal(joinText("New idea. Water the", "The tomatoes every morning, and call the plumber on Friday."), "New idea. Water the tomatoes every morning, and call the plumber on Friday.");
+  assert.equal(joinText("New idea. Water the", "Water the tomatoes every morning."), "New idea. Water the tomatoes every morning.");
+  // Case and punctuation don't matter, and the live text's own stays.
+  assert.equal(joinText("Water the tomatoes every morning,", "Morning. And call the plumber."), "Water the tomatoes every morning, and call the plumber.");
+  // A cut-off word where the model's audio starts (part of "Water") is dropped with the repeat after it.
+  assert.equal(joinText("New idea. Water the", "Ter the tomatoes."), "New idea. Water the tomatoes.");
+  assert.equal(joinText("Water the tomatoes", "Ter the tomatoes every morning."), "Water the tomatoes every morning.");
+  // All of it heard already: nothing is added.
+  assert.equal(joinText("Call the plumber on Friday.", "On Friday."), "Call the plumber on Friday.");
+  // No repeat, nothing dropped.
+  assert.equal(joinText("Water the tomatoes", "Every morning."), "Water the tomatoes every morning.");
+  assert.equal(joinText("I went to the", "Store and the bank."), "I went to the store and the bank.");
+  assert.equal(joinText("Water the tomatoes.", "Then the plumber."), "Water the tomatoes. Then the plumber.");
+  assert.equal(joinText("", "The plumber."), "The plumber.");
+});
+
+test("the line under the button: on this device only for a recording that really stays on it", () => {
+  const send = /^Your words go to your own GitHub repo only when you press Send\.$/;
+  const tail = (s: string) => s.slice(s.indexOf("Your words"));
+  const live = promiseLine(true, false);
+  assert.equal(live, "What you say is sent to Sayfold's server to be turned into text, and isn't kept. Your words go to your own GitHub repo only when you press Send.");
+  assert.equal(promiseLine(null, false), live, "the status hasn't answered: the page may yet use the server");
+  assert.equal(promiseLine(true, true), live);
+  const off = promiseLine(false, false);
+  assert.equal(off, "Live text is off right now, so speech is turned into text on this device and stays on it. Your words go to your own GitHub repo only when you press Send.");
+  // Live text went off during a recording that was (partly) sent: that recording is never said to have stayed here.
+  const after = promiseLine(false, true);
+  assert.equal(after, "Part or all of this recording was sent to Sayfold's server to be turned into text, and isn't kept. Live text is off now, so the next one stays on this device. Your words go to your own GitHub repo only when you press Send.");
+  for (const l of [live, off, after]) assert.match(tail(l), send);
+  assert.doesNotMatch(after.slice(0, after.indexOf("Live text is off")), /on this device|stays/);
 });
 
 test("notes: a short plain line for each reason, saying what happens next", () => {
@@ -268,18 +302,77 @@ test("live: stop before the socket opens still sends everything, then stop", asy
   assert.deepEqual(await end, { text: "Hi.", from: null, reason: null });
 });
 
-test("live: the connection dropping mid-recording keeps the text, and the in-browser model takes over after the last words", async () => {
+test("live: the connection dropping mid-recording keeps the text, and the in-browser model takes over a margin before the last words came", async () => {
+  // The words lag the audio: "Water the" came at 2.5 s, but "tomatoes" may have been said before then.
+  assert.ok(LAG_MARGIN >= 0.5 && LAG_MARGIN <= 1, `${LAG_MARGIN}`);
   const { ws, live, seen } = session();
   ws.open();
   live.push(tone(1.5));
   ws.say({ type: "update", turn: 0, text: "Water" });
   live.push(tone(1));
+  ws.say({ type: "update", turn: 0, text: "Water the" });
+  live.push(tone(1));
   ws.hangUp();
   assert.deepEqual(seen.fallbacks, ["error"]);
-  assert.deepEqual(await live.finish(), { text: "Water", from: 1.5, reason: "error" });
+  assert.deepEqual(await live.finish(), { text: "Water the", from: 2.5 - LAG_MARGIN, reason: "error" });
 });
 
-test("live: no close after stop in time: the text so far is kept, and anything after the last words goes to the in-browser model", async () => {
+test("live: a drop soon after the start gives the in-browser model all of the recording", async () => {
+  const { ws, live } = session();
+  ws.open();
+  live.push(tone(0.4));
+  ws.say({ type: "update", turn: 0, text: "New" });
+  live.push(tone(1));
+  ws.fail();
+  assert.deepEqual(await live.finish(), { text: "New", from: 0, reason: "error" });
+});
+
+test("live: a fallback that doesn't say how much the server took starts a margin before the last words, not from the start", async () => {
+  const { ws, live } = session();
+  ws.open();
+  live.push(tone(2));
+  ws.say({ type: "end-of-turn", turn: 0, text: "New idea." });
+  live.push(tone(1));
+  ws.say({ type: "update", turn: 1, text: "Water the tomatoes" });
+  live.push(tone(1));
+  ws.say({ type: "fallback", reason: "idle" });
+  ws.hangUp();
+  assert.deepEqual(await live.finish(), { text: "New idea. Water the tomatoes", from: 3 - LAG_MARGIN, reason: "idle" });
+});
+
+test("live: whether any audio went to the server", async () => {
+  // Never opened: nothing was sent.
+  const a = session();
+  a.live.push(tone(0.5));
+  a.ws.fail();
+  await a.live.finish();
+  assert.equal(a.live.sentAudio, false);
+  // Opened, refused before a whole frame was recorded: nothing was sent.
+  const b = session();
+  b.ws.open();
+  b.ws.say({ type: "fallback", reason: "cap" });
+  b.live.push(tone(1));
+  await b.live.finish();
+  assert.equal(b.live.sentAudio, false);
+  // A frame went out before the refusal.
+  const c = session();
+  c.live.push(tone(0.1));
+  c.ws.open();
+  c.ws.say({ type: "fallback", reason: "cap" });
+  await c.live.finish();
+  assert.equal(c.live.sentAudio, true);
+  // Only the part of a frame at stop.
+  const d = session();
+  d.ws.open();
+  d.live.push(tone(0.01));
+  assert.equal(d.live.sentAudio, false);
+  const end = d.live.finish();
+  d.ws.hangUp();
+  await end;
+  assert.equal(d.live.sentAudio, true);
+});
+
+test("live: no close after stop in time: the text so far is kept, and the in-browser model takes over a margin before the last words came", async () => {
   const { ws, live } = session();
   ws.open();
   live.push(tone(2));
@@ -288,7 +381,7 @@ test("live: no close after stop in time: the text so far is kept, and anything a
   const end = live.finish();
   mock.timers.tick(STOP_WAIT_MS);
   assert.ok(ws.closedBy !== null);
-  assert.deepEqual(await end, { text: "Water the tomatoes", from: 2, reason: "error" });
+  assert.deepEqual(await end, { text: "Water the tomatoes", from: 2 - LAG_MARGIN, reason: "error" });
 });
 
 test("live: a send that throws (the socket closing under it) is a fallback, not an exception", async () => {

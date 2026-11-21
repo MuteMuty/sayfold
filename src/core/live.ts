@@ -12,6 +12,14 @@ export const STATUS_WAIT_MS = 3000;
 export const OPEN_WAIT_MS = 5000;
 /** After stop, how long to wait for the server to close (it waits up to 3 s for the last words itself). */
 export const STOP_WAIT_MS = 5000;
+/**
+ * When the server can't say how much audio it took (the socket dropped, or a fallback without `seconds`), the
+ * in-browser model starts this many seconds before the last words came: the words lag the audio, so the last
+ * ones may stand for speech well before they arrived. What both heard is shown once (joinText).
+ */
+export const LAG_MARGIN = 1;
+/** The most words the live text's end and the in-browser model's start may share: about a second of speech. */
+const MAX_OVERLAP = 6;
 
 type Fetch = (input: string, init?: RequestInit) => Promise<Response>;
 
@@ -75,16 +83,46 @@ export class LiveText {
   }
 }
 
+/** A word as said: no case, no punctuation. */
+const said = (w: string) => w.toLowerCase().replace(/[^\p{L}\p{N}']/gu, "");
+
 /**
- * The live text and the in-browser model's text for the rest, as one. The model starts every part with a
- * capital, so when the live text stopped mid-sentence, a plain capitalised word ("And", not "I" or "NASA")
- * carries on in lower case.
+ * The live text and the in-browser model's text for the rest, as one. The model may start a little before
+ * the live text ended (LAG_MARGIN), so the words both heard show once: the longest run of the live text's
+ * last words that the model's text starts with, after at most one cut-off word where its audio began. The
+ * model starts every part with a capital, so when the live text stopped mid-sentence, a plain capitalised
+ * word ("And", not "I" or "NASA") carries on in lower case.
  */
 export function joinText(live: string, rest: string): string {
   const a = live.trim();
   let b = rest.trim();
+  const tail = a.split(/\s+/).map(said);
+  const head = b.split(/\s+/);
+  const words = head.map(said);
+  find: for (let k = Math.min(MAX_OVERLAP, tail.length, words.length); k > 0; k--) {
+    for (const skip of [0, 1]) {
+      if (skip + k > words.length) continue;
+      if (tail.slice(-k).every((w, i) => w && w === words[skip + i])) {
+        b = head.slice(skip + k).join(" ");
+        break find;
+      }
+    }
+  }
   if (a && !/[.!?…]["')\]]*$/.test(a) && /^[A-Z][a-z]/.test(b)) b = b[0]!.toLowerCase() + b.slice(1);
   return [a, b].filter(Boolean).join(" ");
+}
+
+const SEND = "Your words go to your own GitHub repo only when you press Send.";
+
+/**
+ * The line under the Record button: what happens to what you say. `liveOn` is whether the next recording
+ * uses live text (null until the status answers); `sent`, whether audio of the recording on screen went to
+ * the server. A recording that was sent, even in part, is never said to have stayed on this device.
+ */
+export function promiseLine(liveOn: boolean | null, sent: boolean): string {
+  if (liveOn !== false) return `What you say is sent to Sayfold's server to be turned into text, and isn't kept. ${SEND}`;
+  if (sent) return `Part or all of this recording was sent to Sayfold's server to be turned into text, and isn't kept. Live text is off now, so the next one stays on this device. ${SEND}`;
+  return `Live text is off right now, so speech is turned into text on this device and stays on it. ${SEND}`;
 }
 
 const WHY: Record<FallbackReason, string> = {
@@ -143,6 +181,7 @@ export class LiveSession {
   private partialLength = 0;
   /** Seconds of the recording pushed when the last words came. */
   private heardTo = 0;
+  private sent = false;
   private done!: (end: LiveEnd) => void;
   private readonly ended = new Promise<LiveEnd>((resolve) => (this.done = resolve));
   private timer: ReturnType<typeof setTimeout> | null = null;
@@ -183,6 +222,11 @@ export class LiveSession {
     this.flush();
   }
 
+  /** Whether any of the recording's audio went to the server. */
+  get sentAudio(): boolean {
+    return this.sent;
+  }
+
   /** Ends the recording: the last audio, then stop, then the server's last words and its close. */
   finish(): Promise<LiveEnd> {
     if (this.state !== "ended" && !this.stopAsked) {
@@ -205,7 +249,10 @@ export class LiveSession {
   private flush(): void {
     if (this.state !== "open" && this.state !== "stopping") return;
     try {
-      for (const frame of this.queue) this.ws!.send(frame);
+      for (const frame of this.queue) {
+        this.ws!.send(frame);
+        this.sent = true;
+      }
       this.queue = [];
     } catch {
       this.fallBack("error", null);
@@ -228,7 +275,7 @@ export class LiveSession {
     if (this.state === "ended") return;
     const m = parseServerMessage(data);
     if (!m) return;
-    if (m.type === "fallback") return this.fallBack(m.reason, m.seconds ?? 0);
+    if (m.type === "fallback") return this.fallBack(m.reason, m.seconds ?? null);
     this.live.receive(m);
     this.heardTo = this.pushed / SAMPLE_RATE;
     this.on.text(this.live.parts);
@@ -243,12 +290,15 @@ export class LiveSession {
 
   /**
    * The server can't take (the rest of) this recording. The text so far stays. The in-browser model takes
-   * over from the audio the server took (`taken`, in seconds; unknown when the connection just failed), and
-   * never later than where the last words came: anything said after them may not have been heard.
+   * over from the audio the server took (`taken`, in seconds), and never later than where the last words
+   * came: anything said after them may not have been heard. When it's unknown (the connection failed, or the
+   * fallback didn't say), the last words may stand for audio from well before they came, so it starts
+   * LAG_MARGIN earlier, and joinText drops what both heard.
    */
   private fallBack(reason: FallbackReason, taken: number | null): void {
     if (this.state === "ended") return;
-    const end: LiveEnd = { text: this.live.text, from: Math.min(taken ?? Infinity, this.heardTo), reason };
+    const from = taken === null ? Math.max(0, this.heardTo - LAG_MARGIN) : Math.min(taken, this.heardTo);
+    const end: LiveEnd = { text: this.live.text, from, reason };
     this.end(end);
     this.on.fallback(end);
   }
