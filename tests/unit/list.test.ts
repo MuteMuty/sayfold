@@ -56,6 +56,27 @@ test("a bare \"- \" line, first or anywhere, is never the title or an empty task
   assert.equal(titleFrom("---\nNotes"), "---");
 });
 
+test("a list line with only punctuation (\"- .\", \"- ,\", \"- ...\") is a bare \"- \" line: never the title or a task-list item", () => {
+  // Typed in the review, or written by the correction model: no letters or digits, so no item.
+  for (const mark of ["- .", "- ,", "- ...", "-  ;", "- !", "- ?", "- -", "- [ ] .", "  - …", "- —"]) {
+    assert.equal(titleFrom(mark), "", JSON.stringify(mark));
+    assert.equal(bodyFrom(mark), "", JSON.stringify(mark));
+    assert.equal(copyNote("", mark).text, "", JSON.stringify(mark));
+    for (const [text, title, body] of [
+      [`${mark}\nBuy milk.`, "Buy milk", "Buy milk."],
+      [`Groceries\n${mark}\n- milk\n${mark}`, "Groceries", "Groceries\n\n- [ ] Milk"],
+      [`${mark}\n- milk\n- bread`, "Milk", "- [ ] Milk\n- [ ] Bread"],
+      [`Weekend\n${mark}\nat the cabin`, "Weekend", "Weekend\nat the cabin"],
+    ] as const) {
+      assert.equal(titleFrom(text), title, JSON.stringify(text));
+      assert.equal(bodyFrom(text), body, JSON.stringify(text));
+      assert.equal(copyNote("", text).text, body, JSON.stringify(text));
+    }
+  }
+  // An item with a letter or a digit in it is still an item.
+  assert.equal(bodyFrom("Dates:\n- 5.\n- e.g."), "Dates:\n\n- [ ] 5\n- [ ] E.g");
+});
+
 test("only a dash and a space start an item: other dashes are just text", () => {
   for (const text of ["-5 degrees tonight.", "Well -- maybe.", "---\nNotes", "A well-known bug - in the header.", "Bread – and butter."]) {
     assert.equal(bodyFrom(text), text);
@@ -135,6 +156,10 @@ test("50,000 spaces, dots, commas or the like format in well under 100 ms", () =
     `List\n-${" ".repeat(n)}\nx`,
     `${"-\n".repeat(n / 2)}x`,
     `${"- [ ]\n".repeat(n / 6)}x`,
+    `List\n-${" ".repeat(n)}.`,
+    `List\n- ${".".repeat(n)}`,
+    `${"- .\n".repeat(n / 4)}x`,
+    `${" ".repeat(n)}- ${" ".repeat(n)}.`,
     `${"!?".repeat(n / 2)}x`,
     "\n".repeat(n),
     `a${"\t \n".repeat(n / 3)}b`,

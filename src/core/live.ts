@@ -6,6 +6,7 @@
 import {
   LISTEN_PATH, SAMPLE_RATE, STATUS_PATH, joinTurn, parseServerMessage, separator, type FallbackReason, type ServerMessage,
 } from "../listen/protocol.ts";
+import { withoutTrailingBareItems } from "./list.ts";
 
 /** 80 ms of audio at 16 kHz, the size of each frame sent. */
 export const FRAME_SAMPLES = 1280;
@@ -123,7 +124,7 @@ const said = (w: string) => w.toLowerCase().replace(/[^\p{L}\p{N}']/gu, "");
  * stopped mid-sentence, a plain capitalised word ("And", not "I" or "NASA") carries on in lower case.
  */
 export function joinText(live: string, rest: string, exact = false): string {
-  const a = live.trim();
+  const a = withoutTrailingBareItems(live).trim();
   let b = rest.trim();
   const tail = a.split(/\s+/).map(said);
   const head = b.split(/\s+/);

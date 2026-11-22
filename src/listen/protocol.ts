@@ -18,6 +18,8 @@
 // text up to that turn with any spoken edit made ("no, Tuesday", "scratch that") and any spoken list as "- "
 // lines. It replaces the text of that turn and every one before it. Turns after it are added as they come.
 
+import { withoutTrailingBareItems } from "../core/list.ts";
+
 export const LISTEN_PATH = "/api/listen";
 /** GET: a ListenStatus, so the page can pick the server or the in-browser model before it records. */
 export const STATUS_PATH = "/api/listen/status";
@@ -97,7 +99,8 @@ export function separator(before: string): string {
 
 /** The text so far with the next turn after it, as said: what's kept when a turn has no correction. */
 export function joinTurn(before: string, turn: string): string {
-  const a = before.trim();
+  // A bare "-" line at the end (an empty item the correction model left) goes, so the turn isn't taken for an item.
+  const a = withoutTrailingBareItems(before).trim();
   const b = turn.trim();
   return a && b ? a + separator(a) + b : a || b;
 }

@@ -10,17 +10,28 @@ export type Block = { kind: "text"; text: string } | { kind: "list"; items: stri
  *  its line (a "- " whose space was trimmed) is an item too, with no words. */
 const ITEM = /^\s*-(?:\s+|$)(?:\[ \]\s*)?/;
 
-/** A line that's only a list mark ("- ", "-" or "- [ ]"): an empty item, which is never a title or a task. Trimmed
- *  first, not one regex with two runs of spaces, which takes seconds on a long run of them. */
+/** A letter or a digit: what makes an item more than its mark. */
+const WORD = /[\p{L}\p{N}]/u;
+
+/** A line that's only a list mark ("- ", "-" or "- [ ]"), or one with only punctuation after it ("- .", "- ,"): an
+ *  empty item, which is never a title or a task. */
 export function isBareItem(line: string): boolean {
-  const t = line.trim();
-  return t === "-" || /^-\s*\[ \]$/.test(t);
+  const m = ITEM.exec(line);
+  return m !== null && !WORD.test(line.slice(m[0].length));
 }
 
 /** `text` without its bare item lines, or `text` itself when it has none. */
 export function withoutBareItems(text: string): string {
   const lines = text.split("\n");
   return lines.some(isBareItem) ? lines.filter((l) => !isBareItem(l)).join("\n") : text;
+}
+
+/** `text` without the bare item lines at its end, so words joined on after it aren't taken for an item. */
+export function withoutTrailingBareItems(text: string): string {
+  const lines = text.split("\n");
+  let end = lines.length;
+  while (end > 0 && (isBareItem(lines[end - 1]) || !lines[end - 1].trim())) end--;
+  return end === lines.length ? text : lines.slice(0, end).join("\n");
 }
 /** What's trimmed from the end of an item: spaces, full stops and commas. */
 const ITEM_END = /[\s.,;]/;
@@ -52,7 +63,8 @@ export function parseList(text: string): Block[] | null {
   };
   for (const line of text.split("\n")) {
     const m = ITEM.exec(line);
-    const item = m && capital(trimEndOf(line.slice(m[0].length), ITEM_END));
+    const rest = m ? line.slice(m[0].length) : "";
+    const item = WORD.test(rest) && capital(trimEndOf(rest, ITEM_END));
     if (item) {
       found = true;
       endPara();

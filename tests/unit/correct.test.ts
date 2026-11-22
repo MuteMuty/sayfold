@@ -220,6 +220,35 @@ test("correct: after a list, the plain text of a turn starts on a new line, so i
   assert.deepEqual(r.quota === false && r.text, "Shopping list:\n- Milk\n- Bread\nThen call the bank.");
 });
 
+test("correct: a bare \"-\" line at the end of the text is dropped before the plain text of a turn, so it isn't a list item", async () => {
+  // The model's text so far ended in an empty item, then the next turn's reply was junk.
+  for (const doc of ["Shopping list:\n- Milk\n-", "Shopping list:\n- Milk\n- ", "Shopping list:\n- Milk\n- .\n-"]) {
+    const r = await correct(model({ response: "" }).ai, doc, "Then call the bank.");
+    assert.deepEqual(r.quota === false && r.text, "Shopping list:\n- Milk\nThen call the bank.", JSON.stringify(doc));
+  }
+  const r = await correct(model({ response: "" }).ai, "Call the bank.\n-", "Then lunch.");
+  assert.deepEqual(r.quota === false && r.text, "Call the bank. Then lunch.");
+});
+
+test("readFix: a reply of only dash lines is an empty reply: with \"scratch that\" it's empty text, otherwise junk", () => {
+  // The choice (fix round 2): the same rule as "<text></text>", so the review never opens with "-" in its text box.
+  for (const reply of ["-", "- ", "-\n-", "- \n- .\n- [ ]", "  - ,  "]) {
+    assert.equal(readFix(`<text>${reply}</text>`, "Buy milk.", "Scratch that."), "", JSON.stringify(reply));
+    assert.equal(readFix(`<text>${reply}</text>`, "Add a dark mode.", "Delete that."), "", JSON.stringify(reply));
+    assert.equal(readFix(`<text>${reply}</text>`, DOC, SAID), null, JSON.stringify(reply));
+    assert.equal(readFix(`<text>${reply}</text>`, "", "Hello there."), null, JSON.stringify(reply));
+  }
+  // A bare line among words is left out of the text too.
+  assert.equal(readFix("<text>Shopping list:\n- Milk\n-</text>", "", "Shopping list: milk."), "Shopping list:\n- Milk");
+});
+
+test("correct: a reply of only \"-\" keeps the plain text of a plain turn, and is nothing after \"scratch that\"", async () => {
+  const plain = await correct(model(says("-")).ai, DOC, SAID);
+  assert.deepEqual(plain.quota === false && { text: plain.text, fixed: plain.fixed }, { text: PLAIN, fixed: false });
+  const scratched = await correct(model(says("-")).ai, "Buy milk.", "Scratch that.");
+  assert.deepEqual(scratched.quota === false && { text: scratched.text, fixed: scratched.fixed }, { text: "", fixed: true });
+});
+
 test("correct: when the model fails, the turn's plain text is kept", async () => {
   for (const message of [AI_ERRORS.capacity, AI_ERRORS.throws, "AiError: 5000: timeout after 3036 ms"]) {
     const r = await correct(model(new Error(message)).ai, DOC, SAID);

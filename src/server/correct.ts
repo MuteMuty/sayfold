@@ -6,6 +6,7 @@
 //
 // The model can fail, be slow or write junk. Then the turn's plain text is kept (joinTurn), so dictation always
 // works. The text and the reply pass through memory only: nothing here stores, logs or throws them.
+import { withoutBareItems } from "../core/list.ts";
 import { joinTurn } from "../listen/protocol.ts";
 import {
   CHARS_PER_TOKEN, FIX_INPUT_NEURONS_PER_M_TOKENS, FIX_MAX_TOKENS, FIX_MODEL, FIX_OUTPUT_NEURONS_PER_M_TOKENS, FIX_TIMEOUT_MS,
@@ -57,7 +58,8 @@ const count = (s: string, c: string) => s.split(c).length - 1;
 export function readFix(raw: string, doc: string, said: string): string | null {
   const m = /^\s*<text>([\s\S]*)<\/text>\s*$/.exec(raw);
   if (!m || /<\/?text>/.test(m[1])) return null;
-  const text = m[1].trim();
+  // An empty item ("-" alone, or with only punctuation) is never wanted, and a reply of nothing else is an empty one.
+  const text = withoutBareItems(m[1]).trim();
   const input = `${doc}\n${said}`;
   if (text.length > LONGER * input.length + 40) return null;
   if (MARKDOWN.some((c) => count(text, c) > count(input, c))) return null;

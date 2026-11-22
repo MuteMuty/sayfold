@@ -130,6 +130,17 @@ test("spoken corrections: \"scratch that\" can leave nothing, and a spoken list'
   assert.equal(t.text, "Shopping list:\n- Milk\n- Bread\n- Eggs\n- Butter\nThen call the bank.");
 });
 
+test("a bare \"-\" line at the end of the corrected text is dropped before the next turn, so the turn isn't a list item", () => {
+  const t = new LiveText();
+  t.receive({ type: "end-of-turn", turn: 0, text: "Shopping list: milk." });
+  t.receive({ type: "text", turn: 0, text: "Shopping list:\n- Milk\n-" });
+  t.receive({ type: "end-of-turn", turn: 1, text: "Then call the bank." });
+  assert.equal(t.text, "Shopping list:\n- Milk\nThen call the bank.");
+  // The same when the in-browser model takes over after it.
+  assert.equal(joinText("Shopping list:\n- Milk\n- ", "Then call the bank."), "Shopping list:\n- Milk\nThen call the bank.");
+  assert.equal(joinText("Shopping list:\n- Milk\n- .", "Then call the bank."), "Shopping list:\n- Milk\nThen call the bank.");
+});
+
 test("empty text: words heard and then all scratched are told apart from silence", () => {
   // "Buy milk." then "Scratch that.": the correction model rightly sends empty text.
   const t = new LiveText();
