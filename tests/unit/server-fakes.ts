@@ -29,6 +29,8 @@ type Listener = (event: { data: unknown }) => void;
 /** One end of a WebSocket: records what is sent and closed, and lets a test deliver messages to it. */
 export class FakeSocket implements Socket {
   accepted = false;
+  /** As in the Workers runtime from compatibility date 2026-11-01 (standard WebSockets): binary frames arrive as Blobs unless set to "arraybuffer". */
+  binaryType: "blob" | "arraybuffer" = "blob";
   sent: (string | Uint8Array)[] = [];
   closed: { code?: number; reason?: string } | null = null;
   private listeners = new Map<string, Listener[]>();
@@ -50,6 +52,7 @@ export class FakeSocket implements Socket {
   }
   /** Delivers an event, as the other end (or the network) would. */
   emit(type: "message" | "close" | "error", data?: unknown): void {
+    if (type === "message" && this.binaryType === "blob" && (data instanceof ArrayBuffer || ArrayBuffer.isView(data))) data = new Blob([data as ArrayBuffer]);
     for (const fn of this.listeners.get(type) ?? []) fn({ data });
   }
   /** The JSON messages sent, parsed. */
