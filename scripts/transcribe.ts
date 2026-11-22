@@ -1,6 +1,5 @@
 // What the speech model really writes for a clip: plays each WAV into Sayfold's page through a stand-in
-// microphone, as the playtest does, and prints the transcript the review screen shows. The spoken-list
-// fixtures in tests/fixtures/list-transcripts.json were made with it (lab#80).
+// microphone, as the playtest does, and prints the transcript the review screen shows (lab#80).
 //
 // Usage: node scripts/transcribe.ts <baseUrl> [--cpu] [--snr <dB>] <clip.wav>...
 //   --cpu   serve the speech worker without WebAssembly JSPI, so it runs on the CPU (as in Safari or Firefox)

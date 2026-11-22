@@ -37,6 +37,19 @@ test("the config: Flux at $0.0077 a minute is about 11.7 neurons a second, so th
   assert.equal(utcDay(Date.UTC(2026, 10, 22, 0, 0, 0)), "2026-11-22");
 });
 
+test("add: the correction model's neurons count toward the day's cap, but not toward the visitor's seconds", async () => {
+  const { core, db } = meter();
+  const r = await openOk(core);
+  assert.deepEqual(core.add(r.session, 1, 30), { ok: true });
+  const day = db.prepare("SELECT neurons FROM days").get() as { neurons: number };
+  assert.ok(Math.abs(day.neurons - (NEURONS_PER_AUDIO_SECOND + 30)) < 1e-9, String(day.neurons));
+  assert.equal((db.prepare("SELECT seconds FROM visitors").get() as { seconds: number }).seconds, 1);
+  // Model neurons alone, with no audio, can close the day.
+  assert.deepEqual(core.add(r.session, 0, DAILY_NEURON_CAP), { ok: false, reason: "cap" });
+  assert.deepEqual(await core.status(IP), { available: false });
+  assert.equal((db.prepare("SELECT seconds FROM visitors").get() as { seconds: number }).seconds, 1);
+});
+
 test("open: a new visitor gets a session of up to 2 minutes, and the day starts available", async () => {
   const { core } = meter();
   assert.deepEqual(await core.status(IP), { available: true });

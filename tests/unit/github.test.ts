@@ -100,11 +100,11 @@ test("the issue: trimmed title and text; an empty title falls back to one from t
   assert.equal(issueFrom("  ", " \n ", ["idea"]), null);
 });
 
-test("the issue: a spoken list becomes a task list in the body, and the title comes from the words, not the list", () => {
-  assert.deepEqual(issueFrom("Groceries", "Groceries. List. Milk. Bread.", []), { title: "Groceries", body: "Groceries.\n\n- [ ] Milk\n- [ ] Bread", labels: [] });
-  assert.deepEqual(issueFrom("", "List. Milk. Bread.", []), { title: "Milk", body: "- [ ] Milk\n- [ ] Bread", labels: [] });
-  // Only "list", with nothing after it, is nothing to send.
-  assert.equal(issueFrom("", "List.", []), null);
+test("the issue: \"- \" lines become a task list in the body, and the title comes from the words, not the list", () => {
+  assert.deepEqual(issueFrom("Shopping list", "Shopping list:\n- Milk\n- Bread", []), { title: "Shopping list", body: "Shopping list:\n\n- [ ] Milk\n- [ ] Bread", labels: [] });
+  assert.deepEqual(issueFrom("", "- Milk\n- Bread", []), { title: "Milk", body: "- [ ] Milk\n- [ ] Bread", labels: [] });
+  // "list" is just a word (lab#102): the text is sent as it is.
+  assert.deepEqual(issueFrom("", "My shopping list: milk, eggs", []), { title: "My shopping list: milk, eggs", body: "My shopping list: milk, eggs", labels: [] });
 });
 
 // --- labels -----------------------------------------------------------------------------------

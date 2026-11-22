@@ -13,6 +13,10 @@
 //   much of the audio the server took (none when absent): the server drains Flux's last words for that audio
 //   before it sends the fallback, so the in-browser model takes the recording from there.
 // - Send audio continuously, silence included: a socket with no audio for a few seconds is closed (`idle`).
+//
+// Spoken corrections (lab#109, slice 3): after each `end-of-turn`, the Worker sends `text`, the whole running
+// text up to that turn with any spoken edit made ("no, Tuesday", "scratch that") and any spoken list as "- "
+// lines. It replaces the text of that turn and every one before it. Turns after it are added as they come.
 
 export const LISTEN_PATH = "/api/listen";
 /** GET: a ListenStatus, so the page can pick the server or the in-browser model before it records. */
@@ -46,6 +50,8 @@ export type ServerMessage =
   | { type: "update"; turn: number; text: string }
   /** The turn is finished: its final text. The next turn starts with a higher number. */
   | { type: "end-of-turn"; turn: number; text: string }
+  /** The whole running text up to and including `turn`, with spoken edits made: it replaces those turns' text. */
+  | { type: "text"; turn: number; text: string }
   /** `seconds`: the audio the server took and turned into text, from the start of the stream; absent when none. */
   | { type: "fallback"; reason: FallbackReason; seconds?: number };
 
@@ -71,7 +77,7 @@ export function parseServerMessage(data: unknown): ServerMessage | null {
     return null;
   }
   if (typeof m !== "object" || m === null) return null;
-  if ((m.type === "update" || m.type === "end-of-turn") && Number.isInteger(m.turn) && typeof m.text === "string") {
+  if ((m.type === "update" || m.type === "end-of-turn" || m.type === "text") && Number.isInteger(m.turn) && typeof m.text === "string") {
     return { type: m.type, turn: m.turn as number, text: m.text };
   }
   if (m.type === "fallback" && REASONS.includes(m.reason as FallbackReason)) {
@@ -80,4 +86,18 @@ export function parseServerMessage(data: unknown): ServerMessage | null {
     return typeof m.seconds === "number" && m.seconds >= 0 && Number.isFinite(m.seconds) ? { type: "fallback", reason, seconds: m.seconds } : null;
   }
   return null;
+}
+
+/** What goes between the text so far and the next turn: a new line after a list's last item, so the turn isn't
+ *  taken for part of it, and otherwise a space. */
+export function separator(before: string): string {
+  const a = before.trimEnd();
+  return a.slice(a.lastIndexOf("\n") + 1).startsWith("- ") ? "\n" : " ";
+}
+
+/** The text so far with the next turn after it, as said: what's kept when a turn has no correction. */
+export function joinTurn(before: string, turn: string): string {
+  const a = before.trim();
+  const b = turn.trim();
+  return a && b ? a + separator(a) + b : a || b;
 }

@@ -76,10 +76,11 @@ test("frames: 80 ms each, of 16-bit little-endian samples, clipped to range", ()
 test("the server's messages are checked before they're used", () => {
   assert.deepEqual(parseServerMessage('{"type":"update","turn":0,"text":"Water"}'), { type: "update", turn: 0, text: "Water" });
   assert.deepEqual(parseServerMessage('{"type":"end-of-turn","turn":2,"text":"Done."}'), { type: "end-of-turn", turn: 2, text: "Done." });
+  assert.deepEqual(parseServerMessage('{"type":"text","turn":1,"text":"Shopping list:\\n- Milk"}'), { type: "text", turn: 1, text: "Shopping list:\n- Milk" });
   assert.deepEqual(parseServerMessage('{"type":"fallback","reason":"cap"}'), { type: "fallback", reason: "cap" });
   assert.deepEqual(parseServerMessage('{"type":"fallback","reason":"idle","seconds":2.5}'), { type: "fallback", reason: "idle", seconds: 2.5 });
   for (const bad of ["", "x", "null", "[]", '{"type":"update","turn":"0","text":"x"}', '{"type":"update","turn":0}', '{"type":"fallback","reason":"tired"}',
-    '{"type":"fallback","reason":"cap","seconds":-1}', '{"type":"hello"}']) {
+    '{"type":"fallback","reason":"cap","seconds":-1}', '{"type":"hello"}', '{"type":"text","turn":0}', '{"type":"text","turn":0.5,"text":"x"}']) {
     assert.equal(parseServerMessage(bad), null, bad);
   }
   assert.equal(parseServerMessage(new ArrayBuffer(2)), null);
@@ -100,6 +101,35 @@ test("the running text: ended turns, then the latest update of the turn being sp
   assert.equal(t.text, "Water the tomatoes every morning. And call");
 });
 
+test("spoken corrections: the corrected text replaces every turn up to its own, and later turns follow it", () => {
+  const t = new LiveText();
+  t.receive({ type: "end-of-turn", turn: 0, text: "Let's meet on Monday at ten." });
+  t.receive({ type: "end-of-turn", turn: 1, text: "No, Tuesday." });
+  t.receive({ type: "update", turn: 2, text: "Bring the" });
+  assert.equal(t.text, "Let's meet on Monday at ten. No, Tuesday. Bring the");
+  t.receive({ type: "text", turn: 0, text: "Let's meet on Monday at ten." });
+  assert.equal(t.text, "Let's meet on Monday at ten. No, Tuesday. Bring the");
+  t.receive({ type: "text", turn: 1, text: "Let's meet on Tuesday at ten." });
+  assert.deepEqual(t.parts, [{ text: "Let's meet on Tuesday at ten.", done: true }, { text: "Bring the", done: false }]);
+  assert.equal(t.text, "Let's meet on Tuesday at ten. Bring the");
+  // An older correction arriving late doesn't undo a newer one; neither does a late end of a corrected turn.
+  t.receive({ type: "text", turn: 0, text: "Let's meet on Monday at ten." });
+  t.receive({ type: "end-of-turn", turn: 1, text: "No, Tuesday." });
+  assert.equal(t.text, "Let's meet on Tuesday at ten. Bring the");
+});
+
+test("spoken corrections: \"scratch that\" can leave nothing, and a spoken list's lines stay lines, with the next turn on a line of its own", () => {
+  const t = new LiveText();
+  t.receive({ type: "end-of-turn", turn: 0, text: "Add a dark mode." });
+  t.receive({ type: "end-of-turn", turn: 1, text: "Delete that." });
+  t.receive({ type: "text", turn: 1, text: "" });
+  assert.deepEqual(t.parts, []);
+  t.receive({ type: "end-of-turn", turn: 2, text: "Shopping list: milk, bread, eggs and butter." });
+  t.receive({ type: "text", turn: 2, text: "Shopping list:\n- Milk\n- Bread\n- Eggs\n- Butter" });
+  t.receive({ type: "update", turn: 3, text: "Then call the bank." });
+  assert.equal(t.text, "Shopping list:\n- Milk\n- Bread\n- Eggs\n- Butter\nThen call the bank.");
+});
+
 test("joining the live text and the in-browser model's text", () => {
   assert.equal(joinText("Water the tomatoes.", " And call the plumber. "), "Water the tomatoes. And call the plumber.");
   // Mid-sentence, the in-browser model's capital goes (it starts every part with one), but not a name's or "I"'s.
@@ -110,6 +140,8 @@ test("joining the live text and the in-browser model's text", () => {
   assert.equal(joinText("Is it done?", "Yes."), "Is it done? Yes.");
   assert.equal(joinText("", "Call the plumber."), "Call the plumber.");
   assert.equal(joinText(" Water. ", ""), "Water.");
+  // After a spoken list, the rest starts on a line of its own, with its capital.
+  assert.equal(joinText("Shopping list:\n- Milk\n- Bread", "Then call the bank."), "Shopping list:\n- Milk\n- Bread\nThen call the bank.");
 });
 
 test("joining: words the in-browser model heard again where the live text ended show once", () => {
@@ -151,7 +183,7 @@ test("the line under the button: on this device only for a recording that really
   const send = /^Your words go to your own GitHub repo only when you press Send\.$/;
   const tail = (s: string) => s.slice(s.indexOf("Your words"));
   const live = promiseLine(true, false);
-  assert.equal(live, "What you say is sent to Sayfold's server to be turned into text, and isn't kept. Your words go to your own GitHub repo only when you press Send.");
+  assert.equal(live, "What you say is sent to Sayfold's server to be turned into text and edited as you ask, and isn't kept. Your words go to your own GitHub repo only when you press Send.");
   assert.equal(promiseLine(null, false), live, "the status hasn't answered: the page may yet use the server");
   assert.equal(promiseLine(true, true), live);
   const off = promiseLine(false, false);
@@ -242,6 +274,43 @@ test("live: words show as they come; stop waits for the close and keeps the last
   ws.hangUp();
   assert.deepEqual(await end, { text: "New idea. Water the tomatoes every morning", from: null, exact: true, reason: null });
   assert.deepEqual(seen.fallbacks, []);
+});
+
+test("live: a correction replaces the words on screen, and stop waits for the close, keeping the corrected text", async () => {
+  const { ws, live, seen } = session();
+  ws.open();
+  live.push(tone(1));
+  ws.say({ type: "end-of-turn", turn: 0, text: "Let's meet on Monday at ten." });
+  ws.say({ type: "text", turn: 0, text: "Let's meet on Monday at ten." });
+  live.push(tone(1));
+  ws.say({ type: "end-of-turn", turn: 1, text: "No, Tuesday." });
+  const end = live.finish();
+  // The correction of the last turn comes after stop, before the close.
+  ws.say({ type: "text", turn: 1, text: "Let's meet on Tuesday at ten." });
+  ws.hangUp();
+  assert.deepEqual(seen.text, [
+    "Let's meet on Monday at ten.",
+    "Let's meet on Monday at ten.",
+    "Let's meet on Monday at ten. No, Tuesday.",
+    "Let's meet on Tuesday at ten.",
+  ]);
+  assert.deepEqual(await end, { text: "Let's meet on Tuesday at ten.", from: null, exact: true, reason: null });
+});
+
+test("live: a correction isn't new words: where the in-browser model takes over still follows the last words", async () => {
+  const { ws, live } = session();
+  ws.open();
+  live.push(tone(2));
+  ws.say({ type: "end-of-turn", turn: 0, text: "Water the tomatoes." });
+  live.push(tone(2));
+  // The correction comes 2 s of audio after the words it's about; then the connection drops.
+  ws.say({ type: "text", turn: 0, text: "Water the tomatoes." });
+  ws.hangUp();
+  assert.deepEqual(await live.finish(), { text: "Water the tomatoes.", from: 2 - LAG_MARGIN, exact: false, reason: "error" });
+});
+
+test("live: after stop, the page waits longer than the server can take to send its last words and correction", () => {
+  assert.ok(STOP_WAIT_MS >= 8000, String(STOP_WAIT_MS));
 });
 
 test("live: a fallback in the middle keeps the text so far, stops sending, and the in-browser model takes over from the audio the server took", async () => {

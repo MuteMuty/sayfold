@@ -5,7 +5,7 @@ export const TITLE_MAX = 72;
 const MIN_CLAUSE = 6;
 
 /** The first line, or its first sentence when the transcript is one paragraph, capitalised; a long one ends at a clause break or a word.
- * With a spoken list, the words before it ("Things to try, list, dark mode" gives "Things to try"), or its first item when it's said first. */
+ * With a task list, the words before it ("Shopping list:\n- Milk" gives "Shopping list"), or its first item when it comes first. */
 export function titleFrom(text: string): string {
   const blocks = parseList(text);
   if (!blocks) return firstTitle(text);
@@ -36,7 +36,7 @@ function firstTitle(text: string): string {
 /** For comparing a title with the text: case, spacing and the end mark don't count. */
 const plain = (s: string) => trimEndOf(s.replace(/\s+/g, " ").trim(), /[.!?…]/).toLowerCase();
 
-/** What Copy puts on the clipboard (the title, a blank line, then the text as Send sends it, with any spoken list as a
+/** What Copy puts on the clipboard (the title, a blank line, then the text as Send sends it, with any "- " lines as a
  *  task list; either may be empty), and what it says. A title that's the whole text is copied once. */
 export function copyNote(title: string, text: string): { text: string; message: string } {
   const t = title.trim();

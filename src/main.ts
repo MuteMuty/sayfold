@@ -11,6 +11,7 @@ import { Likes, likeLabel, shortCount } from "./core/likes.ts";
 import { loadAnalytics, track } from "./analytics.ts";
 import { EVENTS, playEvents, PROJECT, type Backend, type Finisher } from "./analytics-events.ts";
 import { LiveSession, fallbackNote, joinText, listenUrl, liveStatus, promiseLine, type LiveEnd, type Part, type SocketLike } from "./core/live.ts";
+import { separator } from "./listen/protocol.ts";
 import { StreamResampler } from "./core/resample.ts";
 import { connect, send, issueFrom, parseRepo, preselected, repoName, sendButton, tokenProblem, type GitHubProblem, type Label } from "./core/github.ts";
 import { GitHubLink } from "./core/token.ts";
@@ -173,9 +174,10 @@ function renderPromise() {
   promise.textContent = promiseLine(liveOn, liveSent);
 }
 
+/** The running text: the corrected text so far (a spoken list on lines of its own), then the turn being spoken, lighter. */
 function renderLive(parts: Part[]) {
   liveTextEl.replaceChildren(
-    ...parts.map((p, i) => Object.assign(document.createElement("span"), { textContent: (i ? " " : "") + p.text, className: p.done ? "" : "live-now" })),
+    ...parts.map((p, i) => Object.assign(document.createElement("span"), { textContent: (i ? separator(parts[i - 1]!.text) : "") + p.text, className: p.done ? "" : "live-now" })),
   );
 }
 
@@ -343,7 +345,7 @@ const preview = $("#preview");
 const previewBody = $("#preview-body");
 const el = <K extends keyof HTMLElementTagNameMap>(tag: K, text = "") => Object.assign(document.createElement(tag), { textContent: text });
 
-/** A spoken list, as it will go to GitHub: shown only while the text has one, and redrawn from the text as it's edited. */
+/** A task list, as it will go to GitHub: shown only while the text has one, and redrawn from the text as it's edited. */
 function renderPreview() {
   const blocks = blocksFrom(textIn.value);
   preview.hidden = !blocks;

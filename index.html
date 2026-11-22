@@ -38,7 +38,7 @@
 
         <!-- Live text: the words as Sayfold's server hears them, while you talk (lab#109). Shown only while it's in use. -->
         <div id="live" class="live">
-          <div class="live-scroll"><p id="live-text" class="live-text" data-hint="Your words show here as you talk."></p></div>
+          <div class="live-scroll"><p id="live-text" class="live-text" data-hint="Your words show here as you talk. Say “no, Tuesday” or “scratch that” to change them."></p></div>
           <p id="live-note" class="live-note" role="status" hidden></p>
         </div>
 
@@ -72,9 +72,9 @@
           <input id="title" class="title" type="text" autocomplete="off" spellcheck="true" maxlength="200" />
           <label class="field-label" for="text">Text</label>
           <textarea id="text" class="text" rows="7" spellcheck="true" aria-describedby="text-hint"></textarea>
-          <p id="text-hint" class="text-hint">Say “list” to start a task list, and “end list” to finish it.</p>
+          <p id="text-hint" class="text-hint">Lines that start with “- ” are sent as a task list.</p>
         </div>
-        <!-- How a spoken list goes to GitHub, shown only while the text has one. The text above is still what you edit. -->
+        <!-- How a task list goes to GitHub, shown only while the text has one. The text above is still what you edit. -->
         <section id="preview" class="preview" aria-labelledby="preview-h" hidden>
           <h3 id="preview-h" class="field-label">Sent as a task list</h3>
           <div id="preview-body" class="preview-body"></div>
@@ -113,7 +113,7 @@
       </section>
 
       <!-- What happens to what you say, before you record. When live text is off, main.ts says it stays on this device, but never about a recording that was sent. -->
-      <p id="promise" class="promise">What you say is sent to Sayfold's server to be turned into text, and isn't kept. Your words go to your own GitHub repo only when you press Send.</p>
+      <p id="promise" class="promise">What you say is sent to Sayfold's server to be turned into text and edited as you ask, and isn't kept. Your words go to your own GitHub repo only when you press Send.</p>
     </main>
 
     <!-- Says each change of state to screen readers: recording, transcribing, ready. -->
