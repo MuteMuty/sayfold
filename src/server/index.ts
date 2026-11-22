@@ -2,7 +2,7 @@
 // /api/listen for live dictation (src/server/listen.ts), with the day's counter in one SQLite-backed
 // Durable Object (src/server/meter.ts). Type-checked with the Workers types (src/server/tsconfig.json).
 import { DurableObject } from "cloudflare:workers";
-import { handle, type MeterApi, type Socket, type SpeechAi } from "./listen.ts";
+import { handle, type MeterApi, type Socket, type WorkersAi } from "./listen.ts";
 import { MeterCore, sweepAndSchedule } from "./meter.ts";
 
 interface Env {
@@ -31,8 +31,8 @@ export class Meter extends DurableObject<Env> {
   open(ip: string) {
     return this.#core.open(ip);
   }
-  add(session: string, seconds: number) {
-    return this.#core.add(session, seconds);
+  add(session: string, seconds: number, neurons?: number) {
+    return this.#core.add(session, seconds, neurons);
   }
   close(session: string) {
     this.#core.close(session);
@@ -45,7 +45,7 @@ export class Meter extends DurableObject<Env> {
 export default {
   fetch(request, env, ctx) {
     return handle(request, {
-      ai: env.AI as unknown as SpeechAi,
+      ai: env.AI as unknown as WorkersAi,
       meter: env.METER.get(env.METER.idFromName("sayfold")) as unknown as MeterApi,
       assets: env.ASSETS,
       pair: () => Object.values(new WebSocketPair()) as unknown as [Socket, Socket],

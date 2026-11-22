@@ -1,5 +1,6 @@
 // The live-dictation counter, kept by one SQLite-backed Durable Object (src/server/index.ts): the day's
-// estimated neurons, each visitor's seconds (of audio or time connected) and the recordings open right now.
+// estimated neurons (Flux's and the correction model's), each visitor's seconds (of audio or time connected)
+// and the recordings open right now.
 // A visitor is known only by an HMAC-SHA-256 of their IP address and the day, under a random salt made for
 // that UTC day. Earlier days' salts and counts are deleted at midnight UTC by the Durable Object's alarm
 // (sweepAndSchedule), with or without traffic. No audio, text or IP address is ever stored here.
@@ -87,8 +88,11 @@ export class MeterCore {
     return { ok: true, session, seconds: Math.min(SESSION_MAX_SECONDS, left) };
   }
 
-  /** Counts `seconds` a recording streamed (audio or time connected), and says whether it may go on. */
-  add(session: string, seconds: number): Added {
+  /**
+   * Counts `seconds` a recording streamed (audio or time connected), and the correction model's `neurons` for it,
+   * and says whether it may go on. The model's neurons count toward the day's cap, not the visitor's seconds.
+   */
+  add(session: string, seconds: number, neurons = 0): Added {
     const day = this.today();
     const row = this.sql.exec("SELECT visitor FROM sessions WHERE id = ?", session).toArray()[0];
     if (!row) return { ok: false, reason: "error" };
@@ -96,7 +100,7 @@ export class MeterCore {
     this.sql.exec("UPDATE sessions SET seen = ? WHERE id = ?", this.now(), session);
     this.sql.exec(
       "INSERT INTO days (day, neurons) VALUES (?, ?) ON CONFLICT (day) DO UPDATE SET neurons = neurons + excluded.neurons",
-      day, seconds * NEURONS_PER_AUDIO_SECOND,
+      day, seconds * NEURONS_PER_AUDIO_SECOND + neurons,
     );
     this.sql.exec(
       "INSERT INTO visitors (day, visitor, seconds) VALUES (?, ?, ?) ON CONFLICT (day, visitor) DO UPDATE SET seconds = seconds + excluded.seconds",

@@ -72,7 +72,7 @@ export interface Issue { title: string; body: string; labels: string[] }
 export const issueRequest = (r: Repo, token: string, issue: Issue): [string, RequestInit] =>
   [`${path(r)}/issues`, init(token, { method: "POST", body: JSON.stringify({ title: issue.title, body: issue.body, labels: issue.labels }) })];
 
-/** The issue to create: the title (or one from the text when it's empty), and the text as its body, with spoken lists as task lists. Null when there's nothing to send. */
+/** The issue to create: the title (or one from the text when it's empty), and the text as its body, with its "- " lines as task lists. Null when there's nothing to send. */
 export function issueFrom(title: string, text: string, labels: string[]): Issue | null {
   const body = bodyFrom(text);
   const t = title.trim() || titleFrom(text);

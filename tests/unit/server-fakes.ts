@@ -3,7 +3,8 @@
 import { DatabaseSync } from "node:sqlite";
 import type { Sql } from "../../src/server/meter.ts";
 import { MeterCore } from "../../src/server/meter.ts";
-import type { Runtime, Socket, SpeechAi } from "../../src/server/listen.ts";
+import type { Runtime, Socket, WorkersAi } from "../../src/server/listen.ts";
+import { joinTurn } from "../../src/listen/protocol.ts";
 
 /** The Durable Object's `ctx.storage.sql`, on a real in-memory SQLite database. */
 export function memorySql(): Sql & { db: DatabaseSync } {
@@ -81,12 +82,44 @@ export const AI_ERRORS = {
   throws: "AiError: 5007: No such model @cf/deepgram/flux or task",
 };
 
-/** A mocked AI binding: each run opens a fake Flux socket, or fails as told. `runs` counts every attempt. */
-export function fakeAi(behaviour: "ok" | "no-socket" | keyof typeof AI_ERRORS = "ok") {
+/** One call to the correction model: the text so far and the turn it was given, read back from its prompt. */
+export interface FixCall {
+  model: string;
+  inputs: { messages: { role: string; content: string }[]; temperature: number; max_tokens: number };
+  doc: string;
+  said: string;
+}
+
+/**
+ * The correction model's answer to a call: a reply, an Error to throw, or a promise of either. By default it
+ * types the turn out after the text, as a model that heard no command would.
+ */
+export type FixReply = (call: FixCall) => unknown;
+export const typesOut: FixReply = ({ doc, said }) => ({ response: `<text>${joinTurn(doc, said)}</text>` });
+/** Answers with the text given for each turn (by what was said), and types out any other. */
+export const replies = (byTurn: Record<string, string>): FixReply => (call) =>
+  call.said in byTurn ? { response: `<text>${byTurn[call.said]}</text>` } : typesOut(call);
+
+/**
+ * A mocked AI binding: each Flux run opens a fake Flux socket, or fails as told, and each correction answers as
+ * `fix` says. `runs` counts every attempt to open Flux; `fixes` records every correction asked for.
+ */
+export function fakeAi(behaviour: "ok" | "no-socket" | keyof typeof AI_ERRORS = "ok", fix: FixReply = typesOut) {
   const calls: AiCall[] = [];
+  const fixes: FixCall[] = [];
   const runs = { count: 0 };
-  const ai: SpeechAi = {
-    async run(model, inputs, options) {
+  const box = { fix };
+  const ai = {
+    async run(model: string, inputs: object, options?: { websocket: true }): Promise<any> {
+      if (!options?.websocket) {
+        const i = inputs as FixCall["inputs"];
+        const [, doc, said] = /^TEXT:\n([\s\S]*)\n\nSAID:\n([\s\S]*)$/.exec(i.messages[1].content)!;
+        const call = { model, inputs: i, doc: doc === "(empty)" ? "" : doc, said };
+        fixes.push(call);
+        const r = await box.fix(call);
+        if (r instanceof Error) throw r;
+        return r;
+      }
       runs.count++;
       if (behaviour in AI_ERRORS) throw new Error(AI_ERRORS[behaviour as keyof typeof AI_ERRORS]);
       const upstream = new FakeSocket();
@@ -94,7 +127,8 @@ export function fakeAi(behaviour: "ok" | "no-socket" | keyof typeof AI_ERRORS = 
       return { webSocket: behaviour === "no-socket" ? null : upstream };
     },
   };
-  return { ai, calls, runs };
+  /** `box.fix` can be changed part way through a test. */
+  return { ai: ai as WorkersAi, calls, runs, fixes, box };
 }
 
 /** A Worker runtime around a real meter (on memorySql) and a mocked AI, with a settable clock. */
@@ -112,7 +146,7 @@ export function setup(opts: { ai?: ReturnType<typeof fakeAi>; start?: number } =
     meter: {
       status: async (ip) => core.status(ip),
       open: async (ip) => core.open(ip),
-      add: async (session, seconds) => core.add(session, seconds),
+      add: async (session, seconds, neurons) => core.add(session, seconds, neurons),
       close: async (session) => core.close(session),
       exhausted: async () => core.exhausted(),
     },

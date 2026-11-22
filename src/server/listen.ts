@@ -1,16 +1,22 @@
 // The Worker's requests: the live-dictation WebSocket and its status (lab#109), and the page's own
 // static files for everything else. A recording's audio goes from the page to Workers AI's Flux model
-// and its text comes back; both pass through memory only. Nothing here logs, and nothing but the
+// and its text comes back; on each finished turn, the text so far goes to the correction model
+// (src/server/correct.ts) and the whole corrected text comes back. All of it passes through memory only:
+// the text so far lives in the session and is dropped when it ends. Nothing here logs, and nothing but the
 // counter's numbers is stored (src/server/meter.ts).
 import {
   BYTES_PER_SECOND, LISTEN_PATH, SAMPLE_RATE, STATUS_PATH, parseClientMessage,
   type FallbackReason, type ListenStatus, type ServerMessage,
 } from "../listen/protocol.ts";
 import {
-  DRAIN_MS, IDLE_SECONDS, KEYTERMS, LOCAL_ORIGIN, MAX_FRAME_BYTES, MIP_OPT_OUT, ORIGINS, QUOTA_CODE, QUOTA_REFUSAL, REPORT_EVERY_SECONDS,
+  DRAIN_MS, FIX_WAIT_MS, IDLE_SECONDS, KEYTERMS, LOCAL_ORIGIN, MAX_FRAME_BYTES, MIP_OPT_OUT, ORIGINS, REPORT_EVERY_SECONDS,
   SESSION_MAX_SECONDS, SPEECH_MODEL,
 } from "./config.ts";
 import type { Added, Opened } from "./meter.ts";
+import { isQuotaRefusal } from "./quota.ts";
+import { correct } from "./correct.ts";
+
+export { isQuotaRefusal };
 
 /** The part of a Workers WebSocket used here. */
 export interface Socket {
@@ -21,23 +27,24 @@ export interface Socket {
   addEventListener(type: "close" | "error", fn: () => void): void;
 }
 
-/** The AI binding's WebSocket mode (`env.AI.run(model, inputs, { websocket: true })`). */
-export interface SpeechAi {
+/** The AI binding: Flux in its WebSocket mode (`env.AI.run(model, inputs, { websocket: true })`), and the correction model. */
+export interface WorkersAi {
   run(model: string, inputs: object, options: { websocket: true }): Promise<{ webSocket?: Socket | null }>;
+  run(model: string, inputs: object): Promise<unknown>;
 }
 
 /** The counter's Durable Object, as the Worker calls it. */
 export interface MeterApi {
   status(ip: string): Promise<ListenStatus>;
   open(ip: string): Promise<Opened>;
-  add(session: string, seconds: number): Promise<Added>;
+  add(session: string, seconds: number, neurons?: number): Promise<Added>;
   close(session: string): Promise<void>;
   exhausted(): Promise<void>;
 }
 
 /** What the Worker needs from its runtime, so the tests can stand in for it. */
 export interface Runtime {
-  ai: SpeechAi;
+  ai: WorkersAi;
   meter: MeterApi;
   assets: { fetch(request: Request): Promise<Response> };
   /** A new WebSocketPair: the page's end and the Worker's end. */
@@ -82,19 +89,6 @@ async function listen(request: Request, rt: Runtime): Promise<Response> {
 }
 
 /**
- * Whether Workers AI refused because the account's daily free allocation is used up: an error (or Flux's
- * Error message) whose `code` is 3036, or whose text is in the refusal's own form (QUOTA_REFUSAL).
- */
-export function isQuotaRefusal(error: unknown): boolean {
-  if (error == null) return false;
-  if (typeof error !== "object") return QUOTA_REFUSAL.test(String(error));
-  const e = error as { code?: unknown; message?: unknown; description?: unknown };
-  if (e.code === QUOTA_CODE || e.code === String(QUOTA_CODE)) return true;
-  const texts = [e.message, e.description].filter((t): t is string => typeof t === "string");
-  return texts.some((t) => QUOTA_REFUSAL.test(t));
-}
-
-/**
  * Flux's messages as the page's; "quota" when Flux reports the account's daily refusal, and "error" for any
  * other error it reports. Anything else is dropped.
  */
@@ -112,13 +106,14 @@ export function fromFlux(data: unknown): ServerMessage | "error" | "quota" | nul
   return { type: m.event === "EndOfTurn" ? "end-of-turn" : "update", turn: m.turn_index, text: m.transcript };
 }
 
-/** One recording: the page's socket, Flux's socket, and the time counted between them. */
+/** One recording: the page's socket, Flux's socket, the time counted between them, and the text so far. */
 class Session {
   private client: Socket;
   private rt: Runtime;
   private flux: Socket | null = null;
   private id = "";
-  private state: "starting" | "open" | "draining" | "closed" = "starting";
+  /** `draining`: waiting for Flux's last words after stop; `settling`: then for the corrections still running. */
+  private state: "starting" | "open" | "draining" | "settling" | "closed" = "starting";
   /** Sent to the page as a fallback when the session ends, if set. */
   private reason: FallbackReason | null = null;
   private budgetBytes = 0;
@@ -133,6 +128,11 @@ class Session {
   private reports: Promise<void> = Promise.resolve();
   private timer: ReturnType<typeof setTimeout> | null = null;
   private ticker: ReturnType<typeof setInterval> | null = null;
+  /** The running text with spoken edits made, in memory only, and dropped when the session ends. */
+  private doc = "";
+  /** Corrections asked for and not yet done, one after another in turn order. */
+  private fixing = 0;
+  private fixes: Promise<void> = Promise.resolve();
 
   constructor(client: Socket, rt: Runtime) {
     this.client = client;
@@ -164,7 +164,7 @@ class Session {
     const flux = this.flux;
     flux.accept();
     flux.addEventListener("message", (e) => this.fromFlux(e.data));
-    flux.addEventListener("close", () => (this.state === "draining" ? this.end() : this.end("error")));
+    flux.addEventListener("close", () => (this.state === "draining" || this.state === "settling" ? this.settle() : this.end("error")));
     flux.addEventListener("error", () => this.end("error"));
     this.client.addEventListener("message", (e) => this.fromClient(e.data));
     this.client.addEventListener("close", () => this.end());
@@ -219,11 +219,58 @@ class Session {
     if (m === "error") return this.end("error");
     if (m === "quota") return this.rt.waitUntil(this.quota());
     if (!m) return;
+    this.send(m);
+    if (m.type === "end-of-turn") this.fix(m.turn, m.text);
+  }
+
+  private get closed(): boolean {
+    return this.state === "closed";
+  }
+
+  private send(m: ServerMessage): void {
     try {
       this.client.send(JSON.stringify(m));
     } catch {
       this.end(); // The page has gone.
     }
+  }
+
+  /**
+   * Asks the correction model for the whole text with the finished turn applied, after the corrections before it,
+   * and sends it to the page. When it fails, is slow or writes junk, the turn's plain text is kept instead. Its
+   * neurons count toward the day's cap; Workers AI's daily refusal closes the day, as Flux's does.
+   */
+  private fix(turn: number, said: string): void {
+    if (!said.trim()) return;
+    this.fixing++;
+    this.fixes = this.fixes
+      .then(async () => {
+        if (this.closed) return;
+        const r = await correct(this.rt.ai, this.doc, said);
+        if (r.quota) return this.closed ? undefined : this.rt.waitUntil(this.quota());
+        // Counted even when the page has gone meanwhile: the model did the work.
+        if (r.neurons > 0) this.spend(r.neurons);
+        if (this.closed) return;
+        this.doc = r.text;
+        this.send({ type: "text", turn, text: r.text });
+      })
+      .finally(() => {
+        this.fixing--;
+        if (this.state === "settling" && this.fixing === 0) this.end();
+      });
+  }
+
+  /** Counts the correction model's neurons, and stops the session when the counter says so. */
+  private spend(neurons: number): void {
+    this.reports = this.reports.then(async () => {
+      let added: Added;
+      try {
+        added = await this.rt.meter.add(this.id, 0, neurons);
+      } catch {
+        added = { ok: false, reason: "error" };
+      }
+      if (!added.ok) this.finish(added.reason);
+    });
   }
 
   /** Workers AI refused for the day: this recording falls back, and so does the rest of the UTC day. */
@@ -264,7 +311,19 @@ class Session {
     } catch {
       return this.end(reason);
     }
-    this.timer = setTimeout(() => this.end(), DRAIN_MS);
+    this.timer = setTimeout(() => this.settle(), DRAIN_MS);
+  }
+
+  /**
+   * Flux has sent its last words (or had DRAIN_MS to): ends once the corrections still running are done, so the
+   * page gets the corrected text before the close, but waits for them at most FIX_WAIT_MS.
+   */
+  private settle(): void {
+    if (this.state === "closed" || this.state === "settling") return;
+    if (this.fixing === 0) return this.end();
+    this.state = "settling";
+    if (this.timer !== null) clearTimeout(this.timer);
+    this.timer = setTimeout(() => this.end(), FIX_WAIT_MS);
   }
 
   /** Closes both sockets now, tells the page why if there's a reason, and frees the visitor's session. */
@@ -272,6 +331,7 @@ class Session {
     if (this.state === "closed") return;
     this.state = "closed";
     this.endedAt = Date.now();
+    this.doc = "";
     if (this.timer !== null) clearTimeout(this.timer);
     if (this.ticker !== null) clearInterval(this.ticker);
     try {
@@ -287,6 +347,7 @@ class Session {
     } catch {
       // So has Flux.
     }
-    if (this.id) this.rt.waitUntil(this.report().then(() => this.rt.meter.close(this.id)).catch(() => {}));
+    // After any correction still running has counted its neurons.
+    if (this.id) this.rt.waitUntil(this.fixes.then(() => this.report()).then(() => this.rt.meter.close(this.id)).catch(() => {}));
   }
 }

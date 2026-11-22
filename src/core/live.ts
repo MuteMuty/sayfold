@@ -1,8 +1,12 @@
 // Live text (lab#109): while the visitor talks, the page streams the microphone to Sayfold's Worker, which
 // sends back the words as they're heard (src/listen/protocol.ts). Whenever the server can't be used, the
 // in-browser model turns the recording into text instead, and no words are lost: the text that did come is
-// kept, and only the audio after it goes to the in-browser model. Nothing here is stored.
-import { LISTEN_PATH, SAMPLE_RATE, STATUS_PATH, parseServerMessage, type FallbackReason, type ServerMessage } from "../listen/protocol.ts";
+// kept, and only the audio after it goes to the in-browser model. With spoken corrections (slice 3), the server
+// also sends the whole corrected text after each turn, which replaces the words shown for it. Nothing here is stored.
+import {
+  LISTEN_PATH, SAMPLE_RATE, STATUS_PATH, joinTurn, parseServerMessage, separator, type FallbackReason, type ServerMessage,
+} from "../listen/protocol.ts";
+import { withoutTrailingBareItems } from "./list.ts";
 
 /** 80 ms of audio at 16 kHz, the size of each frame sent. */
 export const FRAME_SAMPLES = 1280;
@@ -10,8 +14,11 @@ export const FRAME_SAMPLES = 1280;
 export const STATUS_WAIT_MS = 3000;
 /** How long the socket may take to open; the audio waits in memory meanwhile, so nothing is lost by giving up. */
 export const OPEN_WAIT_MS = 5000;
-/** After stop, how long to wait for the server to close (it waits up to 3 s for the last words itself). */
-export const STOP_WAIT_MS = 5000;
+/**
+ * After stop, how long to wait for the server to close. It waits up to 3 s for the last words itself, then up to
+ * 4 s for their correction (src/server/config.ts: DRAIN_MS, FIX_WAIT_MS).
+ */
+export const STOP_WAIT_MS = 8500;
 /**
  * When the server can't say how much audio it took (the socket dropped, or a fallback without `seconds`), or
  * says it took more than its last words cover, the in-browser model starts this many seconds before the last
@@ -66,21 +73,42 @@ export interface Part {
   done: boolean;
 }
 
-/** The running text: every ended turn, and the latest update of any turn that hasn't ended, in order. */
+/**
+ * The running text: the latest corrected text, then every ended turn after it, and the latest update of any turn
+ * that hasn't ended, in order.
+ */
 export class LiveText {
   private turns = new Map<number, Part>();
+  /** The whole text up to and including `turn`, with spoken edits made. */
+  private fixed: { turn: number; text: string } | null = null;
+  /** Whether any words were heard, corrected away since or not. */
+  private heard = false;
 
   receive(m: Extract<ServerMessage, { turn: number }>): void {
+    if (m.type !== "text" && m.text.trim()) this.heard = true;
+    if (m.type === "text") {
+      if (this.fixed && this.fixed.turn >= m.turn) return;
+      this.fixed = { turn: m.turn, text: m.text.trim() };
+      for (const turn of this.turns.keys()) if (turn <= m.turn) this.turns.delete(turn);
+      return;
+    }
+    if (this.fixed && m.turn <= this.fixed.turn) return;
     if (this.turns.get(m.turn)?.done) return;
     this.turns.set(m.turn, { text: m.text.trim(), done: m.type === "end-of-turn" });
   }
 
   get parts(): Part[] {
-    return [...this.turns.entries()].sort(([a], [b]) => a - b).map(([, p]) => p).filter((p) => p.text);
+    const turns = [...this.turns.entries()].sort(([a], [b]) => a - b).map(([, p]) => p);
+    return [...(this.fixed ? [{ text: this.fixed.text, done: true }] : []), ...turns].filter((p) => p.text);
   }
 
   get text(): string {
-    return this.parts.map((p) => p.text).join(" ");
+    return this.parts.reduce((text, p) => joinTurn(text, p.text), "");
+  }
+
+  /** Words were heard, and spoken edits ("scratch that") took all of them back: empty, but not silence. */
+  get scratched(): boolean {
+    return this.heard && this.fixed !== null && this.text === "";
   }
 }
 
@@ -96,7 +124,7 @@ const said = (w: string) => w.toLowerCase().replace(/[^\p{L}\p{N}']/gu, "");
  * stopped mid-sentence, a plain capitalised word ("And", not "I" or "NASA") carries on in lower case.
  */
 export function joinText(live: string, rest: string, exact = false): string {
-  const a = live.trim();
+  const a = withoutTrailingBareItems(live).trim();
   let b = rest.trim();
   const tail = a.split(/\s+/).map(said);
   const head = b.split(/\s+/);
@@ -110,8 +138,9 @@ export function joinText(live: string, rest: string, exact = false): string {
       }
     }
   }
-  if (a && !/[.!?…]["')\]]*$/.test(a) && /^[A-Z][a-z]/.test(b)) b = b[0]!.toLowerCase() + b.slice(1);
-  return [a, b].filter(Boolean).join(" ");
+  const gap = separator(a);
+  if (a && gap === " " && !/[.!?…]["')\]]*$/.test(a) && /^[A-Z][a-z]/.test(b)) b = b[0]!.toLowerCase() + b.slice(1);
+  return a && b ? a + gap + b : a || b;
 }
 
 const SEND = "Your words go to your own GitHub repo only when you press Send.";
@@ -122,7 +151,7 @@ const SEND = "Your words go to your own GitHub repo only when you press Send.";
  * the server. A recording that was sent, even in part, is never said to have stayed on this device.
  */
 export function promiseLine(liveOn: boolean | null, sent: boolean): string {
-  if (liveOn !== false) return `What you say is sent to Sayfold's server to be turned into text, and isn't kept. ${SEND}`;
+  if (liveOn !== false) return `What you say is sent to Sayfold's server to be turned into text and edited as you ask, and isn't kept. ${SEND}`;
   if (sent) return `Part or all of this recording was sent to Sayfold's server to be turned into text, and isn't kept. Live text is off now, so the next one stays on this device. ${SEND}`;
   return `Live text is off right now, so speech is turned into text on this device and stays on it. ${SEND}`;
 }
@@ -230,6 +259,11 @@ export class LiveSession {
     this.flush();
   }
 
+  /** Whether the server heard words and the speaker's spoken edits took all of them back. */
+  get scratched(): boolean {
+    return this.live.scratched;
+  }
+
   /** Whether any of the recording's audio went to the server. */
   get sentAudio(): boolean {
     return this.sent;
@@ -285,7 +319,8 @@ export class LiveSession {
     if (!m) return;
     if (m.type === "fallback") return this.fallBack(m.reason, m.seconds ?? null);
     this.live.receive(m);
-    this.heardTo = this.pushed / SAMPLE_RATE;
+    // A correction isn't new words: where the in-browser model would take over still follows the last words.
+    if (m.type !== "text") this.heardTo = this.pushed / SAMPLE_RATE;
     this.on.text(this.live.parts);
   }
 

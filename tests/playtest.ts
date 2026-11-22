@@ -67,8 +67,8 @@ const browserPath = process.env.PLAYTEST_BROWSER || "/Applications/Brave Browser
 const WAV = join(repo, "tests/fixtures/idea.wav");
 const WAV_B64 = readFileSync(WAV).toString("base64");
 const EXPECTED_WORDS = ["tomatoes", "plumber", "friday"];
-/** A spoken list, said as the speech model hears it at a normal pace: it writes "Groceries for the weekend, list, milk,
- *  bread, eggs, and list, then call the bank." (see tests/fixtures/list-transcripts.json for how it was made). */
+/** A spoken list, said at a normal pace: "Groceries for the weekend. List. Milk. Bread. Eggs. End list. Then call the
+ *  bank." (say -v Samantha -r 200). The in-browser model has no spoken edits, so it comes back as plain text. */
 const LIST_WAV = readFileSync(join(repo, "tests/fixtures/list-commas.wav"));
 const LIST_B64 = LIST_WAV.toString("base64");
 const LIST_SECONDS = LIST_WAV.readUInt32LE(LIST_WAV.indexOf("data") + 4) / 32000;
@@ -252,8 +252,9 @@ async function mockLikes(ctx, mode: "ok" | "down" = "ok") {
 }
 
 // --- live text: a stand-in for Sayfold's Worker -------------------------------------------------------------
-/** One step of what the stand-in "hears": sent once this many seconds of audio have come. */
-type Step = { at: number; type: "update" | "end-of-turn"; turn: number; text: string };
+/** One step of what the stand-in "hears": sent once this many seconds of audio have come (or, after stop, this many
+ *  seconds after it). A "text" step is the whole corrected text, as the Worker sends after the correction model. */
+type Step = { at: number; type: "update" | "end-of-turn" | "text"; turn: number; text: string };
 /** What the page hears as you'd say the clip: "New idea. Water the tomatoes every morning, and call the plumber on Friday." */
 const IDEA_STEPS: Step[] = [
   { at: 0.4, type: "update", turn: 0, text: "New" },
@@ -267,6 +268,45 @@ const IDEA_STEPS: Step[] = [
 /** Sent after stop, before the close: the last words, as an update (Flux may not end the turn). */
 const IDEA_LAST: Step = { at: 0, type: "update", turn: 1, text: "Water the tomatoes every morning, and call the plumber on Friday." };
 const IDEA_LIVE = "New idea. Water the tomatoes every morning, and call the plumber on Friday.";
+/** Spoken corrections (lab#109, slice 3), as the Worker sends them: Erik's clip c1, then a sentence more. The last
+ *  turn's correction comes a second after stop, before the close: the page must wait for it. */
+const CORRECTION_STEPS: Step[] = [
+  { at: 0.4, type: "update", turn: 0, text: "Let's meet" },
+  { at: 0.9, type: "end-of-turn", turn: 0, text: "Let's meet on Monday at ten." },
+  { at: 1.3, type: "text", turn: 0, text: "Let's meet on Monday at ten." },
+  { at: 1.8, type: "update", turn: 1, text: "No," },
+  { at: 2.3, type: "end-of-turn", turn: 1, text: "No, Tuesday." },
+  { at: 2.9, type: "text", turn: 1, text: "Let's meet on Tuesday at ten." },
+  { at: 3.4, type: "update", turn: 2, text: "Bring the" },
+  { at: 3.9, type: "end-of-turn", turn: 2, text: "Bring the slides." },
+];
+const CORRECTION_LAST: Step[] = [{ at: 1.0, type: "text", turn: 2, text: "Let's meet on Tuesday at ten. Bring the slides." }];
+const CORRECTED = "Let's meet on Tuesday at ten. Bring the slides.";
+/** A spoken list (Erik's clip c3), which the correction model writes as "- " lines, and a sentence after it. */
+const LIST_STEPS: Step[] = [
+  { at: 0.5, type: "update", turn: 0, text: "Shopping list" },
+  { at: 1.5, type: "end-of-turn", turn: 0, text: "Shopping list: milk, bread, eggs and butter." },
+  { at: 2.0, type: "text", turn: 0, text: "Shopping list:\n- Milk\n- Bread\n- Eggs\n- Butter" },
+  { at: 2.6, type: "update", turn: 1, text: "Then call" },
+];
+const LIST_LAST: Step[] = [
+  { at: 0, type: "end-of-turn", turn: 1, text: "Then call the bank." },
+  { at: 0.8, type: "text", turn: 1, text: "Shopping list:\n- Milk\n- Bread\n- Eggs\n- Butter\nThen call the bank." },
+];
+const LISTED = "Shopping list:\n- Milk\n- Bread\n- Eggs\n- Butter\nThen call the bank.";
+/** "Buy milk." then "Scratch that.": the correction model rightly sends empty text. Words came through, and were taken back. */
+const SCRATCH_STEPS: Step[] = [
+  { at: 0.5, type: "update", turn: 0, text: "Buy" },
+  { at: 1.2, type: "end-of-turn", turn: 0, text: "Buy milk." },
+  { at: 1.6, type: "text", turn: 0, text: "Buy milk." },
+  { at: 2.4, type: "update", turn: 1, text: "Scratch" },
+];
+const SCRATCH_LAST: Step[] = [
+  { at: 0, type: "end-of-turn", turn: 1, text: "Scratch that." },
+  { at: 0.8, type: "text", turn: 1, text: "" },
+];
+const SCRATCHED_NOTE = "Everything you said was scratched. Type your idea above, or record again.";
+const SILENCE_TITLE = "No words came through";
 /** Words that lag the audio, as they can: "Water the" (said by about 1.4 s) comes only at 2.1 s, and then the
  *  connection goes, at 2.13 s, while "tomatoes every" is being said. */
 const LAGGING_STEPS: Step[] = [
@@ -283,7 +323,8 @@ type LiveMode = {
    *  clip's pause after "morning,", once the words before it have come. */
   socket: "ok" | "none" | { refuse: Reason } | { pause: Reason } | { drop: "no-close-frame" | Reason } | { cut: Reason; at: number; text: string };
   steps: Step[];
-  last: Step | null;
+  /** Sent after stop, before the close. */
+  last: Step | Step[] | null;
 };
 type Connection = { frames: number[]; times: number[]; bytes: number; texts: string[]; fellBackAt?: number };
 
@@ -318,11 +359,10 @@ async function mockLive(ctx, initial: Partial<LiveMode> = {}) {
         conn.texts.push(m);
         if (JSON.parse(m).type !== "stop") return;
         ended = true;
-        // The last words come after stop, then the close a moment later: the page must wait for it.
-        setTimeout(() => {
-          if (mode.last) say({ type: mode.last.type, turn: mode.last.turn, text: mode.last.text });
-          setTimeout(() => ws.close({ code: 1000, reason: "done" }), 400);
-        }, 300);
+        // The last words (and their correction) come after stop, then the close a moment later: the page must wait for it.
+        const last = mode.last === null ? [] : [mode.last].flat();
+        for (const st of last) setTimeout(() => say({ type: st.type, turn: st.turn, text: st.text }), 300 + st.at * 1000);
+        setTimeout(() => ws.close({ code: 1000, reason: "done" }), 700 + Math.max(0, ...last.map((st) => st.at)) * 1000);
         return;
       }
       conn.frames.push(m.length);
@@ -561,7 +601,7 @@ await check("desktop", async () => {
   assert.equal(await page.inputValue("#title"), "New idea");
   assert.equal(await page.isVisible("#missing"), false, "says part may be missing from a short clip that came through");
   assert.equal(await page.getAttribute("#text", "aria-describedby"), "text-hint");
-  assert.match(await page.textContent("#text-hint"), /Say “list” to start a task list/);
+  assert.match(await page.textContent("#text-hint"), /Lines that start with “- ” are sent as a task list/);
   assert.equal(await page.isVisible("#preview"), false, "a list preview shows for text without a list");
   assert.equal(await page.evaluate(() => document.activeElement.id), "text");
   const backend = await page.evaluate(() => window.__sayfold.backend());
@@ -754,7 +794,7 @@ await check("phone", async () => {
 });
 
 // --- live text (lab#109): words while you talk, streamed to a stand-in for Sayfold's Worker ---------------------
-const PROMISE_LIVE = "What you say is sent to Sayfold's server to be turned into text, and isn't kept. Your words go to your own GitHub repo only when you press Send.";
+const PROMISE_LIVE = "What you say is sent to Sayfold's server to be turned into text and edited as you ask, and isn't kept. Your words go to your own GitHub repo only when you press Send.";
 const PROMISE_OFF = "Live text is off right now, so speech is turned into text on this device and stays on it. Your words go to your own GitHub repo only when you press Send.";
 const PROMISE_SENT_OFF = "Part or all of this recording was sent to Sayfold's server to be turned into text, and isn't kept. Live text is off now, so the next one stays on this device. Your words go to your own GitHub repo only when you press Send.";
 /** The words of a text, without case or punctuation. */
@@ -809,8 +849,8 @@ for (const [size, viewport, mobile, scheme] of [["desktop", { width: 1280, heigh
     await shots(page, `${size}-review-live`);
     await page.emulateMedia({ colorScheme: scheme });
 
-    // The review works as before: the title follows the text, a spoken list becomes a task list, Copy and Send.
-    await page.fill("#text", `${IDEA_LIVE} List, milk, bread, eggs, and list.`);
+    // The review works as before: the title follows the text, "- " lines become a task list, Copy and Send.
+    await page.fill("#text", `${IDEA_LIVE}\n- milk\n- bread\n- eggs`);
     assert.deepEqual(await page.$$eval("#preview li", (els) => els.map((e) => e.textContent)), ["Milk", "Bread", "Eggs"]);
     await page.fill("#text", IDEA_LIVE);
     await page.evaluate(() => document.querySelector("#toast").classList.remove("show"));
@@ -837,6 +877,142 @@ for (const [size, viewport, mobile, scheme] of [["desktop", { width: 1280, heigh
     assert.equal(server.connections.length, 2);
     assert.equal(modelRequests(seen).length, 0);
     console.log(`${label}: "${IDEA_LIVE}" live, ${server.connections[0].frames.length} frames, review ${stopMs} ms after Stop`);
+    await ctx.close();
+  });
+}
+
+// --- spoken corrections: the server's corrected text replaces the words, live and in the review --------------
+for (const [size, viewport, mobile, scheme] of [["desktop", { width: 1280, height: 900 }, false, "light"], ["phone", { width: 390, height: 844 }, true, "dark"]] as const) {
+  await check(`spoken corrections, ${size}`, async () => {
+    const label = `spoken corrections, ${size}`;
+    const { ctx, page, seen, gh, server } = await openPage(label, { viewport, isMobile: mobile, hasTouch: mobile, colorScheme: scheme, ...(mobile && { deviceScaleFactor: 2 }) }, { live: { status: "available", steps: CORRECTION_STEPS, last: CORRECTION_LAST } });
+    const press = (sel: string) => (mobile ? page.locator(sel).tap() : page.locator(sel).click());
+    const liveText = (p) => p.evaluate(() => document.querySelector<HTMLElement>("#live-text").innerText);
+    await page.waitForFunction(() => window.__sayfold.live().on === true, null, { timeout: 5000 });
+    assert.equal(await promiseText(page), PROMISE_LIVE);
+    // Before any words, the live text says spoken edits work.
+    assert.match(await page.getAttribute("#live-text", "data-hint"), /“no, Tuesday” or “scratch that”/);
+
+    // "Let's meet on Monday at ten. No, Tuesday.": the words show, then the correction replaces them.
+    await press("#rec");
+    await waitState(page, ["recording"], 10000);
+    await page.waitForFunction(() => /No, Tuesday/.test(document.querySelector("#live-text").textContent), null, { timeout: 8000 });
+    await page.waitForFunction(() => document.querySelector("#live-text").textContent.startsWith("Let's meet on Tuesday at ten."), null, { timeout: 8000 });
+    assert.doesNotMatch(await liveText(page), /Monday|No, Tuesday/, "the correction didn't replace the words");
+    await page.waitForFunction(() => /Bring the slides/.test(document.querySelector("#live-text").textContent), null, { timeout: 8000 });
+    await shots(page, `${size}-recording-corrected`);
+    await page.emulateMedia({ colorScheme: scheme });
+    await page.waitForTimeout(400);
+    await press("#rec");
+    const t0 = Date.now();
+    await waitState(page, ["review", "problem"], 15000);
+    assert.equal(await state(page), "review", await page.textContent("#problem-title"));
+    // Stop waited for the last turn's correction, which came a second after it.
+    assert.ok(Date.now() - t0 >= 1300, `review after ${Date.now() - t0} ms, before the last correction`);
+    assert.equal(await page.inputValue("#text"), CORRECTED);
+    assert.equal(await page.inputValue("#title"), "Let's meet on Tuesday at ten");
+    assert.equal(await page.isVisible("#preview"), false);
+    assert.deepEqual([(await liveState(page)).by, (await liveState(page)).reason], ["server", null]);
+    await noSideScroll(page, `${label} review`);
+    await shots(page, `${size}-review-corrected`);
+    await page.emulateMedia({ colorScheme: scheme });
+
+    // A spoken list: "- " lines live, then a task list in the review and the sent issue.
+    server.mode.steps = LIST_STEPS;
+    server.mode.last = LIST_LAST;
+    await press("#again");
+    await waitState(page, ["recording"], 10000);
+    await page.waitForFunction(() => /- Butter/.test(document.querySelector("#live-text").textContent), null, { timeout: 8000 });
+    assert.match(await liveText(page), /^Shopping list:\n- Milk\n- Bread\n- Eggs\n- Butter/, "the list's lines don't show as lines");
+    await page.waitForFunction(() => /Then call/.test(document.querySelector("#live-text").textContent), null, { timeout: 8000 });
+    assert.match(await liveText(page), /- Butter\nThen call/, "the next words joined the list's last item");
+    await noSideScroll(page, `${label} recording a list`);
+    await shots(page, `${size}-recording-list`);
+    await page.emulateMedia({ colorScheme: scheme });
+    await page.waitForTimeout(600);
+    await press("#rec");
+    await waitState(page, ["review", "problem"], 15000);
+    assert.equal(await state(page), "review", await page.textContent("#problem-title"));
+    assert.equal(await page.inputValue("#text"), LISTED);
+    assert.equal(await page.inputValue("#title"), "Shopping list");
+    assert.equal(await page.isVisible("#preview"), true, "no task list preview for the spoken list");
+    assert.deepEqual(await page.$$eval("#preview li", (els) => els.map((e) => e.textContent)), ["Milk", "Bread", "Eggs", "Butter"]);
+    assert.deepEqual(await page.$$eval("#preview-body p", (els) => els.map((e) => e.textContent)), ["Shopping list:", "Then call the bank."]);
+    await noSideScroll(page, `${label} review of a list`);
+    await shots(page, `${size}-review-spoken-list`);
+    await page.emulateMedia({ colorScheme: scheme });
+
+    const body = "Shopping list:\n\n- [ ] Milk\n- [ ] Bread\n- [ ] Eggs\n- [ ] Butter\n\nThen call the bank.";
+    await page.evaluate(() => document.querySelector("#toast").classList.remove("show"));
+    await press("#copy");
+    await page.waitForFunction(() => document.querySelector("#toast").classList.contains("show"));
+    assert.equal(await page.evaluate(() => navigator.clipboard.readText()), `Shopping list\n\n${body}`);
+    await press("#send");
+    await page.fill("#gh-repo", REPO);
+    await page.fill("#gh-token", TOKEN);
+    await press("#gh-connect");
+    await page.waitForFunction(() => !document.querySelector<HTMLDialogElement>("#gh").open, null, { timeout: 5000 });
+    await press("#send");
+    await waitState(page, ["sent"], 5000);
+    assert.deepEqual(gh.issues, [{ title: "Shopping list", body, labels: ["idea"] }]);
+    assert.equal(server.connections.length, 2);
+    assert.equal(modelRequests(seen).length, 0, "the live path fetched the in-browser model");
+    tokenOnlyToGitHub(label, seen);
+    console.log(`${label}: "${CORRECTED}", then the list "${LISTED.replace(/\n/g, " / ")}"`);
+    await ctx.close();
+  });
+}
+
+// --- everything scratched isn't silence: an empty review that says so; real silence keeps its own screen ----------
+for (const [size, viewport, mobile, scheme] of [["desktop", { width: 1280, height: 900 }, false, "light"], ["phone", { width: 390, height: 844 }, true, "dark"]] as const) {
+  await check(`scratched, not silence, ${size}`, async () => {
+    const label = `scratched, not silence, ${size}`;
+    const { ctx, page, seen, server } = await openPage(label, { viewport, isMobile: mobile, hasTouch: mobile, colorScheme: scheme, ...(mobile && { deviceScaleFactor: 2 }) }, { live: { status: "available", steps: SCRATCH_STEPS, last: SCRATCH_LAST } });
+    const press = (sel: string) => (mobile ? page.locator(sel).tap() : page.locator(sel).click());
+    await page.waitForFunction(() => window.__sayfold.live().on === true, null, { timeout: 5000 });
+
+    // "Buy milk." shows, then "Scratch that." takes it back.
+    await press("#rec");
+    await waitState(page, ["recording"], 10000);
+    await page.waitForFunction(() => /Buy milk\./.test(document.querySelector("#live-text").textContent), null, { timeout: 8000 });
+    await page.waitForTimeout(1200);
+    await press("#rec");
+    await waitState(page, ["review", "problem"], 15000);
+    assert.equal(await state(page), "review", `"${await page.textContent("#problem-title")}" for words that were scratched`);
+    assert.equal(await page.isVisible("#problem"), false);
+    assert.equal(await page.inputValue("#text"), "");
+    assert.equal(await page.inputValue("#title"), "");
+    assert.equal(await page.isVisible("#scratched"), true, "no line saying everything was scratched");
+    assert.equal((await page.textContent("#scratched")).trim(), SCRATCHED_NOTE);
+    assert.equal(await page.isVisible("#missing"), false);
+    assert.equal(await page.getAttribute("#text", "aria-describedby"), "scratched text-hint");
+    assert.doesNotMatch(await page.evaluate(() => document.body.innerText), /silence|microphone is on/, "the page talks of silence or the microphone");
+    for (const sel of ["#again", "#text"]) assert.equal(await page.isVisible(sel), true, `${sel} isn't there to record again or type`);
+    assert.equal((await liveState(page)).by, "server");
+    await noSideScroll(page, `${label} review`);
+    await shots(page, `${size}-review-scratched`);
+    await page.emulateMedia({ colorScheme: scheme });
+    // Typing works as in any review: the title follows the text.
+    await page.fill("#text", "Buy bread.");
+    assert.equal(await page.inputValue("#title"), "Buy bread");
+
+    // Real silence: no words at all. The silence screen, as before.
+    server.mode.steps = [];
+    server.mode.last = null;
+    await press("#again");
+    await waitState(page, ["recording"], 10000);
+    await page.waitForTimeout(2500);
+    await press("#rec");
+    await waitState(page, ["review", "problem"], 15000);
+    assert.equal(await state(page), "problem", "real silence opened the review");
+    assert.equal(await page.textContent("#problem-title"), SILENCE_TITLE);
+    assert.match(await page.textContent("#problem-body"), /heard only silence/);
+    assert.equal(await page.isVisible("#scratched"), false);
+    await noSideScroll(page, `${label} silence`);
+    await shots(page, `${size}-problem-silence`);
+    assert.equal(server.connections.length, 2);
+    assert.equal(modelRequests(seen).length, 0, "the live path fetched the in-browser model");
+    console.log(`${label}: scratched gives the empty review, silence the silence screen`);
     await ctx.close();
   });
 }
@@ -1297,11 +1473,11 @@ await check("send race", async () => {
   await ctx.close();
 });
 
-// --- a spoken list: previewed live from the text, and sent as a GitHub task list ----------------------------
-await check("spoken list", async () => {
+// --- task lists in the review: "- " lines, typed or from the correction model; "list" is just a word -------------
+await check("task list", async () => {
   for (const [size, viewport, mobile] of [["desktop", { width: 1280, height: 900 }, false], ["phone", { width: 390, height: 844 }, true]] as const) {
-    const label = `spoken list, ${size}`;
-    // On the desktop, a list really said: the speech model writes it with commas, not full stops.
+    const label = `task list, ${size}`;
+    // On the desktop, a list said to the in-browser model: it has no spoken edits, so it types what was said.
     const spoken = !mobile;
     const { ctx, page, seen, gh } = await openPage(label, { viewport, isMobile: mobile, hasTouch: mobile, colorScheme: "light" }, spoken ? { mic: { b64: LIST_B64 } } : {});
     const press = (sel: string) => (mobile ? page.locator(sel).tap() : page.locator(sel).click());
@@ -1309,27 +1485,26 @@ await check("spoken list", async () => {
     const paras = () => page.$$eval("#preview-body p", (els) => els.map((e) => e.textContent));
     await record(page, label, spoken ? LIST_SECONDS + 1 : 5.5, () => press("#rec"));
     assert.equal(await state(page), "review", await page.textContent("#problem-title"));
+    const said = await page.inputValue("#text");
+    assert.equal(await page.isVisible("#preview"), false, `a list preview for "${said}", with no "- " lines`);
     if (spoken) {
-      const said = await page.inputValue("#text");
-      assert.equal(await page.isVisible("#preview"), true, `no preview for the spoken list "${said}"`);
-      assert.deepEqual(await items(), ["Milk", "Bread", "Eggs"], said);
-      assert.deepEqual(await paras(), ["Groceries for the weekend:", "Then call the bank."], said);
-      assert.equal(await page.inputValue("#title"), "Groceries for the weekend");
-      console.log(`${label}: "${said}" (${await page.evaluate(() => window.__sayfold.backend())})`);
-      await shots(page, `${size}-review-spoken-list`);
-      await page.emulateMedia({ colorScheme: "light" });
-    } else assert.equal(await page.isVisible("#preview"), false, "a list preview shows for the clip, which has no list");
+      assert.match(said.toLowerCase(), /milk/, said);
+      assert.doesNotMatch(said, /\n- /, said);
+      console.log(`${label}: "${said}" stays plain (${await page.evaluate(() => window.__sayfold.backend())})`);
+    }
+    assert.match(await page.textContent("#text-hint"), /Lines that start with “- ” are sent as a task list/);
 
-    // Said as a list: the preview shows the items, and follows the text as it's edited, typed lines too.
-    await page.fill("#text", "Groceries for the weekend. List. Milk. Bread.");
-    assert.equal(await page.isVisible("#preview"), true, "no preview for a spoken list");
+    // Typed as "- " lines: the preview shows the items, and follows the text as it's edited.
+    await page.fill("#text", "Groceries for the weekend.\n- milk\n- bread");
+    assert.equal(await page.isVisible("#preview"), true, "no preview for a typed list");
     assert.deepEqual(await items(), ["Milk", "Bread"]);
     assert.equal(await page.inputValue("#title"), "Groceries for the weekend");
-    await page.locator("#text").press("End");
-    await page.locator("#text").pressSequentially(" eggs.");
+    await page.locator("#text").evaluate((t: HTMLTextAreaElement) => t.setSelectionRange(t.value.length, t.value.length));
+    await page.locator("#text").press("Enter");
+    await page.locator("#text").pressSequentially("- eggs");
     assert.deepEqual(await items(), ["Milk", "Bread", "Eggs"]);
     await page.locator("#text").press("Enter");
-    await page.locator("#text").pressSequentially("oat milk");
+    await page.locator("#text").pressSequentially("- oat milk");
     assert.deepEqual(await items(), ["Milk", "Bread", "Eggs", "Oat milk"]);
     assert.deepEqual(await paras(), ["Groceries for the weekend."]);
     await noSideScroll(page, label);
@@ -1344,10 +1519,12 @@ await check("spoken list", async () => {
     assert.equal(await page.textContent("#toast"), "Copied the title and text");
     assert.equal(await page.evaluate(() => navigator.clipboard.readText()), `Groceries for the weekend\n\n${body}`);
 
-    // "list" inside a sentence is just a word, and the preview goes.
+    // "list" in a sentence is just a word (lab#102), and the preview goes.
     const typed = await page.inputValue("#text");
-    await page.fill("#text", "My shopping list is long.");
-    assert.equal(await page.isVisible("#preview"), false, "a preview for \"list\" inside a sentence");
+    for (const text of ["My shopping list: milk, eggs", "Groceries. List. Milk. Bread. End list."]) {
+      await page.fill("#text", text);
+      assert.equal(await page.isVisible("#preview"), false, `a preview for "${text}"`);
+    }
     await page.fill("#text", typed);
     assert.equal(await page.isVisible("#preview"), true);
 

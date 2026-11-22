@@ -4,10 +4,12 @@ import { afterEach, beforeEach, mock, test } from "node:test";
 import assert from "node:assert/strict";
 import { handle, isQuotaRefusal } from "../../src/server/listen.ts";
 import {
-  DRAIN_MS, IDLE_SECONDS, KEYTERMS, MAX_FRAME_BYTES, MIP_OPT_OUT, NEURONS_PER_AUDIO_SECOND, SESSION_MAX_SECONDS, SPEECH_MODEL, VISITOR_SECONDS_PER_DAY,
+  DRAIN_MS, FIX_MODEL, FIX_TIMEOUT_MS, FIX_WAIT_MS, IDLE_SECONDS, KEYTERMS, MAX_FRAME_BYTES, MIP_OPT_OUT, NEURONS_PER_AUDIO_SECOND, SESSION_MAX_SECONDS, SPEECH_MODEL, VISITOR_SECONDS_PER_DAY,
 } from "../../src/server/config.ts";
 import { BYTES_PER_SECOND, LISTEN_PATH, STATUS_PATH, parseClientMessage } from "../../src/listen/protocol.ts";
-import { AI_ERRORS, audio, fakeAi, flux, listenRequest, setup, type FakeSocket } from "./server-fakes.ts";
+import { AI_ERRORS, audio, fakeAi, flux, listenRequest, replies, setup, typesOut, type FakeSocket } from "./server-fakes.ts";
+import { fixNeurons } from "../../src/server/correct.ts";
+import { STOP_WAIT_MS } from "../../src/core/live.ts";
 
 const STOP = JSON.stringify({ type: "stop" });
 
@@ -125,12 +127,15 @@ test("session: Flux's updates and end of turn come back in the page's protocol; 
   upstream.emit("message", new Uint8Array([1, 2]).buffer);
   upstream.emit("message", "not json");
   upstream.emit("message", JSON.stringify({ type: "TurnInfo", event: "Update", turn_index: "0", transcript: "bad" }));
+  await s.settle();
   assert.deepEqual(server.messages, [
     { type: "update", turn: 0, text: "" },
     { type: "update", turn: 0, text: "Water the" },
     { type: "update", turn: 0, text: "Water the tomatoes" },
     { type: "end-of-turn", turn: 0, text: "Water the tomatoes every morning." },
     { type: "update", turn: 1, text: "And call" },
+    // The ended turn's correction comes once the model answers, after the words that came meanwhile.
+    { type: "text", turn: 0, text: "Water the tomatoes every morning." },
   ]);
 });
 
@@ -146,9 +151,13 @@ test("session: stop asks Flux for its last words, relays them, then closes clean
   upstream.emit("message", flux("EndOfTurn", "Call the plumber on Friday."));
   assert.equal(server.closed, null);
   upstream.emit("close");
-  assert.deepEqual(server.messages, [{ type: "end-of-turn", turn: 0, text: "Call the plumber on Friday." }]);
-  assert.deepEqual(server.closed, { code: 1000, reason: "done" });
+  // It waits for the last turn's correction, then closes.
   await s.settle();
+  assert.deepEqual(server.messages, [
+    { type: "end-of-turn", turn: 0, text: "Call the plumber on Friday." },
+    { type: "text", turn: 0, text: "Call the plumber on Friday." },
+  ]);
+  assert.deepEqual(server.closed, { code: 1000, reason: "done" });
   // The session is closed in the counter, with its 1.5 seconds counted.
   assert.equal((await s.core.open("203.0.113.7")).ok, true);
   const used = s.sql.db.prepare("SELECT seconds FROM visitors").get() as { seconds: number };
@@ -434,30 +443,261 @@ test("cap: crossing 9,000 tells every open session and closes it; new sessions f
   assert.equal(s.ai.calls.length, 3);
 });
 
-// --- nothing is kept -------------------------------------------------------------------------
+// --- spoken corrections (slice 3) --------------------------------------------------------------
 
-test("privacy: audio and text pass through, but never reach storage, a log or any other request", async (t) => {
-  const spied = (["log", "info", "warn", "error", "debug", "trace", "dir", "table"] as const).map((m) => t.mock.method(console, m));
-  const fetched = t.mock.method(globalThis, "fetch", async () => new Response(""));
+const texts = (server: FakeSocket) => server.messages.filter((m) => (m as { type: string }).type === "text");
+
+/** Says each turn as Flux would hear it (an update, then its end), and lets the corrections run. */
+async function sayTurns(s: ReturnType<typeof setup>, upstream: FakeSocket, turns: string[], first = 0) {
+  for (const [i, said] of turns.entries()) {
+    upstream.emit("message", flux("Update", said.split(" ").slice(0, 2).join(" "), first + i));
+    upstream.emit("message", flux("EndOfTurn", said, first + i));
+    await s.settle();
+  }
+}
+
+test("corrections: Erik's clips c1, c4 and c6: each turn goes to the model with the text so far, and the page gets the whole corrected text", async () => {
+  for (const [turns, fixed] of [
+    [["Let's meet on Monday at ten.", "No, Tuesday."], "Let's meet on Tuesday at ten."],
+    [["Send the report to Anna.", "I mean Henna."], "Send the report to Henna."],
+    [["The app crashes when I rotate the phone.", "Wait. Not the phone. The tablet."], "The app crashes when I rotate the tablet."],
+  ] as const) {
+    const s = setup({ ai: fakeAi("ok", replies({ [turns[1]]: fixed })) });
+    const { server, upstream } = await connect(s);
+    await sayTurns(s, upstream, [...turns]);
+    assert.deepEqual(s.ai.fixes.map((f) => [f.model, f.doc, f.said]), [
+      [FIX_MODEL, "", turns[0]],
+      [FIX_MODEL, turns[0], turns[1]],
+    ]);
+    assert.deepEqual(texts(server), [
+      { type: "text", turn: 0, text: turns[0] },
+      { type: "text", turn: 1, text: fixed },
+    ]);
+    // The end of each turn still comes first, so the page shows it at once.
+    assert.deepEqual(server.messages.filter((m) => (m as { type: string }).type === "end-of-turn").length, 2);
+  }
+});
+
+test("corrections: \"scratch that\" in one breath, a spoken list, and plain sentences that only sound like commands", async () => {
+  const s = setup({
+    ai: fakeAi("ok", replies({
+      "The login page is slow. It takes ten seconds to load scratch that.": "The login page is slow.",
+      "Shopping list: milk, bread, eggs and butter.": "The login page is slow.\nShopping list:\n- Milk\n- Bread\n- Eggs\n- Butter",
+    })),
+  });
+  const { server, upstream } = await connect(s);
+  await sayTurns(s, upstream, [
+    "The login page is slow. It takes ten seconds to load scratch that.",
+    "Shopping list: milk, bread, eggs and butter.",
+    // Typed out by the model, as said: they aren't commands.
+    "No, I don't think the old design was better.",
+    "Make the list view load faster.",
+    "She likes to scratch the sofa.",
+  ]);
+  assert.deepEqual(texts(server).map((m) => (m as { text: string }).text), [
+    "The login page is slow.",
+    "The login page is slow.\nShopping list:\n- Milk\n- Bread\n- Eggs\n- Butter",
+    // After the list's last item, a new line, so the sentence isn't taken for an item.
+    "The login page is slow.\nShopping list:\n- Milk\n- Bread\n- Eggs\n- Butter\nNo, I don't think the old design was better.",
+    "The login page is slow.\nShopping list:\n- Milk\n- Bread\n- Eggs\n- Butter\nNo, I don't think the old design was better. Make the list view load faster.",
+    "The login page is slow.\nShopping list:\n- Milk\n- Bread\n- Eggs\n- Butter\nNo, I don't think the old design was better. Make the list view load faster. She likes to scratch the sofa.",
+  ]);
+});
+
+test("corrections: turns are corrected one after another, in order, each on the text the one before it made", async () => {
+  const answers: ((v: unknown) => void)[] = [];
+  const s = setup({ ai: fakeAi("ok", () => new Promise((r) => answers.push(r))) });
+  const { server, upstream } = await connect(s);
+  upstream.emit("message", flux("EndOfTurn", "Ship it on the twelfth.", 0));
+  upstream.emit("message", flux("EndOfTurn", "No, the thirteenth.", 1));
+  await s.settle();
+  assert.equal(s.ai.fixes.length, 1, "the second turn waits for the first");
+  answers[0]({ response: "<text>Ship it on the twelfth.</text>" });
+  await s.settle();
+  assert.deepEqual([s.ai.fixes[1].doc, s.ai.fixes[1].said], ["Ship it on the twelfth.", "No, the thirteenth."]);
+  answers[1]({ response: "<text>Ship it on the thirteenth.</text>" });
+  await s.settle();
+  assert.deepEqual(texts(server), [
+    { type: "text", turn: 0, text: "Ship it on the twelfth." },
+    { type: "text", turn: 1, text: "Ship it on the thirteenth." },
+  ]);
+});
+
+test("corrections: an empty turn isn't sent to the model", async () => {
   const s = setup();
-  const IP = "203.0.113.77";
-  const SECRET_TEXT = "Marigold zeppelin password seventeen";
-  // "SAYFOLD-SECRET-AUDIO" as bytes, repeated: easy to spot anywhere it might land.
-  const marker = [...new TextEncoder().encode("SAYFOLD-SECRET-AUDIO")];
-  const { server, upstream } = await connect(s, IP);
-  for (let i = 0; i < 4; i++) server.emit("message", audio(0.75, marker));
-  upstream.emit("message", flux("Update", SECRET_TEXT.slice(0, 15)));
-  upstream.emit("message", flux("EndOfTurn", SECRET_TEXT));
+  const { server, upstream } = await connect(s);
+  upstream.emit("message", flux("EndOfTurn", "  "));
+  await s.settle();
+  assert.equal(s.ai.fixes.length, 0);
+  assert.deepEqual(texts(server), []);
+});
+
+test("corrections: when the model fails or writes junk, that turn's plain text is kept, and the next turn is corrected as usual", async () => {
+  for (const bad of [new Error(AI_ERRORS.capacity), { response: "Sure! <text>Let's meet on Tuesday at ten.</text>" }, { response: "<text>* Tuesday</text>" }, { response: "" }]) {
+    const s = setup({ ai: fakeAi("ok", (call) => (call.said === "No, Tuesday." ? bad : typesOut(call))) });
+    const { server, upstream } = await connect(s);
+    await sayTurns(s, upstream, ["Let's meet on Monday at ten.", "No, Tuesday.", "Bring the slides."]);
+    assert.deepEqual(texts(server).map((m) => (m as { text: string }).text), [
+      "Let's meet on Monday at ten.",
+      "Let's meet on Monday at ten. No, Tuesday.",
+      "Let's meet on Monday at ten. No, Tuesday. Bring the slides.",
+    ], JSON.stringify(String(bad)));
+    assert.equal(s.ai.fixes[2].doc, "Let's meet on Monday at ten. No, Tuesday.");
+    assert.equal(server.closed, null, "the recording goes on");
+  }
+});
+
+test("corrections: a model slower than the timeout keeps the plain text, and its late answer is never sent", async () => {
+  let answer!: (v: unknown) => void;
+  const s = setup({ ai: fakeAi("ok", () => new Promise((r) => (answer = r))) });
+  const { server, upstream } = await connect(s);
+  upstream.emit("message", flux("EndOfTurn", "Let's meet on Monday at ten."));
+  await s.settle();
+  mock.timers.tick(FIX_TIMEOUT_MS - 1);
+  await s.settle();
+  assert.deepEqual(texts(server), [], "gave up before the timeout");
+  mock.timers.tick(1);
+  await s.settle();
+  assert.deepEqual(texts(server), [{ type: "text", turn: 0, text: "Let's meet on Monday at ten." }]);
+  answer({ response: "<text>Let's meet on Friday.</text>" });
+  await s.settle();
+  assert.equal(texts(server).length, 1);
+  assert.equal(server.closed, null);
+});
+
+test("corrections: Workers AI's daily refusal from the model closes the day, as Flux's does", async () => {
+  const s = setup({ ai: fakeAi("ok", () => new Error(AI_ERRORS.quota)) });
+  const { server, upstream } = await connect(s);
+  server.emit("message", audio(1));
+  upstream.emit("message", flux("EndOfTurn", "Let's meet on Monday at ten."));
+  await s.settle();
+  assert.deepEqual(server.messages.at(-1), { type: "fallback", reason: "cap", seconds: 1 });
+  assert.deepEqual(server.closed, { code: 1000, reason: "fallback" });
+  assert.equal(texts(server).length, 0);
+  // The rest of the day is off, without asking Workers AI again.
+  const status = await handle(new Request(`https://sayfold.brightloopapps.com${STATUS_PATH}`), s.rt);
+  assert.deepEqual(await status.json(), { available: false });
+  const runs = s.ai.runs.count;
+  const next = await connect(s, "198.51.100.9");
+  assert.deepEqual(next.server.messages, [{ type: "fallback", reason: "cap" }]);
+  assert.equal(s.ai.runs.count, runs);
+});
+
+test("corrections: the model's neurons count toward the day's cap: from its token usage, or estimated", async () => {
+  const s = setup({ ai: fakeAi("ok", (call) => (call.said === "One." ? { ...(typesOut(call) as object), usage: { prompt_tokens: 1000, completion_tokens: 100 } } : typesOut(call))) });
+  const neurons = () => (s.sql.db.prepare("SELECT neurons FROM days").get() as { neurons: number } | undefined)?.neurons ?? 0;
+  const { upstream } = await connect(s);
+  await sayTurns(s, upstream, ["One."]);
+  assert.ok(Math.abs(neurons() - (1000 * 26668 + 100 * 204805) / 1e6) < 1e-6, String(neurons()));
+  const before = neurons();
+  await sayTurns(s, upstream, ["Two."], 1);
+  const call = s.ai.fixes[1];
+  const prompt = call.inputs.messages.reduce((n, m) => n + m.content.length, 0);
+  assert.ok(Math.abs(neurons() - before - fixNeurons(null, prompt, "<text>One. Two.</text>".length)) < 1e-6);
+});
+
+test("corrections: a correction that takes the day past the cap ends the recording with cap", async () => {
+  const s = setup({ ai: fakeAi("ok", (call) => ({ ...(typesOut(call) as object), usage: { prompt_tokens: 0, completion_tokens: 1_000_000 } })) });
+  const { server, upstream } = await connect(s);
+  await sayTurns(s, upstream, ["A long idea."]);
+  upstream.emit("close");
+  await s.settle();
+  assert.deepEqual(server.messages.at(-1), { type: "fallback", reason: "cap" });
+  assert.deepEqual(await (await handle(new Request(`https://sayfold.brightloopapps.com${STATUS_PATH}`), s.rt)).json(), { available: false });
+});
+
+test("corrections: after stop, the Worker waits for the last turn's correction before it closes, so the review gets it", async () => {
+  let answer!: (v: unknown) => void;
+  const s = setup({ ai: fakeAi("ok", () => new Promise((r) => (answer = r))) });
+  const { server, upstream } = await connect(s);
+  server.emit("message", audio(1));
+  server.emit("message", STOP);
+  upstream.emit("message", flux("EndOfTurn", "Let's meet on Monday at ten. No, Tuesday."));
+  upstream.emit("close");
+  await s.settle();
+  assert.equal(server.closed, null, "closed before the correction came");
+  mock.timers.tick(500);
+  answer({ response: "<text>Let's meet on Tuesday at ten.</text>" });
+  await s.settle();
+  assert.deepEqual(server.messages.slice(-1), [{ type: "text", turn: 0, text: "Let's meet on Tuesday at ten." }]);
+  assert.deepEqual(server.closed, { code: 1000, reason: "done" });
+});
+
+test("corrections: the wait after stop is bounded: a model that never answers leaves the plain text, then the close", async () => {
+  const s = setup({ ai: fakeAi("ok", () => new Promise(() => {})) });
+  const { server, upstream } = await connect(s);
+  server.emit("message", STOP);
+  upstream.emit("message", flux("EndOfTurn", "Call the plumber on Friday."));
+  await s.settle();
+  // Flux never closes either: the drain, then the correction's own timeout.
+  mock.timers.tick(DRAIN_MS);
+  await s.settle();
+  assert.equal(server.closed, null);
+  mock.timers.tick(FIX_TIMEOUT_MS - DRAIN_MS);
+  await s.settle();
+  assert.deepEqual(texts(server), [{ type: "text", turn: 0, text: "Call the plumber on Friday." }]);
+  assert.deepEqual(server.closed, { code: 1000, reason: "done" });
+});
+
+test("corrections: with corrections queued behind a slow one, the close comes at most FIX_WAIT_MS after Flux's", async () => {
+  const s = setup({ ai: fakeAi("ok", () => new Promise(() => {})) });
+  const { server, upstream } = await connect(s);
+  upstream.emit("message", flux("EndOfTurn", "Call the plumber.", 0));
+  upstream.emit("message", flux("EndOfTurn", "On Friday.", 1));
   server.emit("message", STOP);
   upstream.emit("close");
   await s.settle();
-  assert.equal(server.messages.length, 2, "the text did reach the page");
-  assert.equal(upstream.bytes.length, 3 * BYTES_PER_SECOND, "the audio did reach Flux");
+  mock.timers.tick(FIX_WAIT_MS - 1);
+  await s.settle();
+  assert.equal(server.closed, null);
+  mock.timers.tick(1);
+  await s.settle();
+  assert.deepEqual(server.closed, { code: 1000, reason: "done" });
+  // Whatever came is the plain text; the page keeps every ended turn's words anyway.
+  for (const m of texts(server)) assert.equal((m as { text: string }).text, "Call the plumber.");
+  assert.ok(DRAIN_MS + FIX_WAIT_MS < STOP_WAIT_MS, "the page waits longer than the Worker can take");
+});
 
-  for (const spy of spied) assert.equal(spy.mock.callCount(), 0, "nothing is logged at all");
-  assert.equal(fetched.mock.callCount(), 0, "no other request is made");
+test("corrections: a fallback once a turn has ended (the recording going idle, say) also waits for its correction, then says why", async () => {
+  let answer!: (v: unknown) => void;
+  const s = setup({ ai: fakeAi("ok", () => new Promise((r) => (answer = r))) });
+  const { server, upstream } = await connect(s);
+  server.emit("message", audio(1));
+  upstream.emit("message", flux("EndOfTurn", "Remind me to call the dentist."));
+  mock.timers.tick(IDLE_SECONDS * 1000);
+  await s.settle();
+  upstream.emit("close");
+  await s.settle();
+  assert.equal(server.closed, null);
+  answer({ response: "<text>Remind me to call the dentist.</text>" });
+  await s.settle();
+  assert.deepEqual(server.messages.slice(-2), [
+    { type: "text", turn: 0, text: "Remind me to call the dentist." },
+    { type: "fallback", reason: "idle", seconds: 1 },
+  ]);
+});
 
-  const db = s.sql.db;
+test("corrections: when the page goes mid-correction, nothing more is sent, the text is dropped, and the neurons still count", async () => {
+  let answer!: (v: unknown) => void;
+  const s = setup({ ai: fakeAi("ok", () => new Promise((r) => (answer = r))) });
+  const { server, upstream } = await connect(s);
+  upstream.emit("message", flux("EndOfTurn", "Let's meet on Monday at ten."));
+  await s.settle();
+  server.emit("close");
+  answer({ response: "<text>Let's meet on Monday at ten.</text>", usage: { prompt_tokens: 0, completion_tokens: 10_000 } });
+  await s.settle();
+  assert.deepEqual(texts(server), []);
+  assert.ok(upstream.closed, "Flux closed");
+  const day = s.sql.db.prepare("SELECT neurons FROM days").get() as { neurons: number };
+  assert.ok(day.neurons >= 2048, String(day.neurons));
+  // And the visitor's session is freed after it.
+  assert.equal((await s.core.open("203.0.113.7")).ok, true);
+});
+
+// --- nothing is kept -------------------------------------------------------------------------
+
+/** Checks the counter's database holds only its numbers, hashes and dates, and none of `needles`, even in its raw file. */
+function nothingKept(db: ReturnType<typeof setup>["sql"]["db"], needles: string[]) {
   const tables = (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all() as { name: string }[]).map((r) => r.name);
   assert.deepEqual(tables, ["days", "salts", "sessions", "visitors"]);
   const hex64 = /^[0-9a-f]{64}$/;
@@ -478,10 +718,61 @@ test("privacy: audio and text pass through, but never reach storage, a log or an
   // And the raw database file holds none of it either.
   const file = Buffer.from((db as unknown as { serialize?: () => Uint8Array }).serialize?.() ?? []);
   const everything = JSON.stringify(tables.map((n) => db.prepare(`SELECT * FROM "${n}"`).all())) + file.toString("latin1");
-  for (const needle of [SECRET_TEXT, "Marigold", "zeppelin", "SAYFOLD-SECRET-AUDIO", IP, "203.0.113"]) {
-    assert.ok(!everything.includes(needle), `storage holds "${needle}"`);
-  }
-});
+  for (const needle of needles) assert.ok(!everything.includes(needle), `storage holds "${needle}"`);
+}
+
+const SECRET_TEXT = "Marigold zeppelin password seventeen";
+/** What the correction model writes back, marked too: "seventeen" corrected to "eighteen". */
+const SECRET_FIX = "Marigold zeppelin password eighteen";
+
+/**
+ * How the correction model answers in each privacy run: well, with junk that quotes the text, with an error that
+ * quotes the prompt, too slowly, or with the day's refusal quoting it. Each run checks the text reached the model
+ * (and, but for the refusal, came back to the page), and went nowhere else.
+ */
+const MODEL_PATHS: [string, (prompt: string) => unknown][] = [
+  ["a good reply", () => ({ response: `<text>${SECRET_FIX}</text>`, usage: { prompt_tokens: 600, completion_tokens: 12 } })],
+  ["junk", () => ({ response: `Sure! I changed it for you: <text>${SECRET_FIX}</text> (from "${SECRET_TEXT}")` })],
+  ["an error quoting the prompt", (prompt) => new Error(`AiError: 5006: Invalid input: ${prompt}`)],
+  ["no answer in time", () => new Promise(() => {})],
+  ["the day's refusal, quoting the prompt", (prompt) => new Error(`${AI_ERRORS.quota} (input: ${prompt})`)],
+];
+
+for (const [path, answer] of MODEL_PATHS) {
+  test(`privacy: audio, text and the correction model's prompt and reply (${path}) never reach storage, a log or any other request`, async (t) => {
+    const spied = (["log", "info", "warn", "error", "debug", "trace", "dir", "table"] as const).map((m) => t.mock.method(console, m));
+    const fetched = t.mock.method(globalThis, "fetch", async () => new Response(""));
+    const s = setup({ ai: fakeAi("ok", (call) => answer(call.inputs.messages[1].content)) });
+    const IP = "203.0.113.77";
+    // "SAYFOLD-SECRET-AUDIO" as bytes, repeated: easy to spot anywhere it might land.
+    const marker = [...new TextEncoder().encode("SAYFOLD-SECRET-AUDIO")];
+    const { server, upstream } = await connect(s, IP);
+    for (let i = 0; i < 4; i++) server.emit("message", audio(0.75, marker));
+    upstream.emit("message", flux("Update", SECRET_TEXT.slice(0, 15)));
+    upstream.emit("message", flux("EndOfTurn", SECRET_TEXT));
+    await s.settle();
+    mock.timers.tick(FIX_TIMEOUT_MS);
+    await s.settle();
+    server.emit("message", STOP);
+    upstream.emit("close");
+    await s.settle();
+    assert.equal(upstream.bytes.length, 3 * BYTES_PER_SECOND, "the audio did reach Flux");
+    assert.equal(s.ai.fixes.length, 1);
+    assert.match(s.ai.fixes[0].inputs.messages[1].content, new RegExp(SECRET_TEXT), "the text did reach the model");
+    const texts = server.messages.filter((m) => (m as { type: string }).type === "text");
+    const refused = path.startsWith("the day's refusal");
+    if (refused) assert.deepEqual(server.messages.at(-1), { type: "fallback", reason: "cap", seconds: 3 });
+    else assert.deepEqual(texts, [{ type: "text", turn: 0, text: path === "a good reply" ? SECRET_FIX : SECRET_TEXT }], "the text did reach the page");
+
+    for (const spy of spied) assert.equal(spy.mock.callCount(), 0, "nothing is logged at all");
+    assert.equal(fetched.mock.callCount(), 0, "no other request is made");
+    // Nothing the page is told, but the words themselves, carries the text: not a fallback, not a close reason.
+    const told = server.sent.filter((m) => typeof m === "string" && !/"type":"(?:update|end-of-turn|text)"/.test(m)).join(" ") + JSON.stringify(server.closed);
+    for (const needle of ["Marigold", "zeppelin", "TEXT:", "SAID:", "<text>"]) assert.ok(!told.includes(needle), `the page was told "${needle}" outside the text`);
+    assert.ok(!JSON.stringify(upstream.sent.filter((m) => typeof m === "string")).includes("Marigold"), "the text went back to Flux");
+    nothingKept(s.sql.db, [SECRET_TEXT, SECRET_FIX, "Marigold", "zeppelin", "SAYFOLD-SECRET-AUDIO", IP, "203.0.113", "TEXT:", "<text>"]);
+  });
+}
 
 test("privacy: the server code has no logging calls, and the Worker has no analytics, logs or other storage bound", async () => {
   const { readFileSync, readdirSync } = await import("node:fs");
