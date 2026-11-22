@@ -27,7 +27,33 @@ test("items are trimmed, lose a full stop or comma, start with a capital, and a 
   assert.equal(bodyFrom("-   oat milk.  \n  - bread,\n- [ ] eggs"), "- [ ] Oat milk\n- [ ] Bread\n- [ ] Eggs");
   assert.deepEqual(blocksFrom("Groceries\n- milk\n- \n- bread"), [{ kind: "text", text: "Groceries" }, { kind: "list", items: ["Milk", "Bread"] }]);
   assert.equal(blocksFrom("Groceries\n- "), null, "an empty item is no list");
-  assert.equal(bodyFrom("Groceries\n- "), "Groceries\n-");
+});
+
+test("a bare \"- \" line, first or anywhere, is never the title or an empty task-list item: it's left out", () => {
+  // Spoken (the correction model's reply) or typed: a line that is only "- " (or "-", or "- [ ]"), with or without words after.
+  for (const [text, title, body] of [
+    ["- \nBuy milk.", "Buy milk", "Buy milk."],
+    ["- \n- milk\n- bread", "Milk", "- [ ] Milk\n- [ ] Bread"],
+    ["-\nCall the bank. Then lunch.", "Call the bank", "Call the bank. Then lunch."],
+    ["  - [ ]  \nShopping list:\n- milk", "Shopping list", "Shopping list:\n\n- [ ] Milk"],
+    ["Groceries\n- ", "Groceries", "Groceries"],
+    ["Groceries\n-", "Groceries", "Groceries"],
+    ["Groceries\n- \n- milk\n- \n- bread\n- ", "Groceries", "Groceries\n\n- [ ] Milk\n- [ ] Bread"],
+    ["Weekend\n- \nat the cabin", "Weekend", "Weekend\nat the cabin"],
+  ] as const) {
+    assert.equal(titleFrom(text), title, JSON.stringify(text));
+    assert.equal(bodyFrom(text), body, JSON.stringify(text));
+    assert.doesNotMatch(bodyFrom(text), /^\s*-\s*(?:\[ \])?\s*$/m, `an empty item in ${JSON.stringify(text)}`);
+    assert.equal(copyNote("", text).text, body, JSON.stringify(text));
+  }
+  // Nothing but bare lines: no title, nothing to send.
+  for (const text of ["- ", "-", "- \n- \n", "- [ ]"]) {
+    assert.equal(titleFrom(text), "", JSON.stringify(text));
+    assert.equal(bodyFrom(text), "", JSON.stringify(text));
+  }
+  // Other dashes are still words.
+  assert.equal(titleFrom("-5 degrees tonight."), "-5 degrees tonight");
+  assert.equal(titleFrom("---\nNotes"), "---");
 });
 
 test("only a dash and a space start an item: other dashes are just text", () => {
@@ -61,10 +87,12 @@ function rng(seed: number) {
   return () => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
 }
 
-test("fuzz: any text without a \"- \" item line is sent byte for byte as it was, trimmed", () => {
+test("fuzz: any text without a \"- \" item line, or an empty one, is sent byte for byte as it was, trimmed", () => {
   const words = ["list", "and", "end", "of", "List", "LIST:", "milk", "the", "a", "-", "--", "-5", "e.g.", "[ ]", "*", "2.5", "list:", "well-known"];
   const gaps = [" ", " ", " ", ", ", ". ", "? ", "! ", "; ", "\n", "  ", " - ", "\n\n", ".\n", ": ", "\n "];
   const item = /^\s*-\s+(?:\[ \]\s*)?[^\s.,;]/m;
+  // A line that's only a dash (an empty item) is left out, as the test above checks.
+  const bare = /^[^\S\n]*-[^\S\n]*(?:\[ \][^\S\n]*)?$/m;
   const next = rng(80);
   const pick = <T,>(xs: T[]) => xs[Math.floor(next() * xs.length)];
   let checked = 0;
@@ -72,7 +100,7 @@ test("fuzz: any text without a \"- \" item line is sent byte for byte as it was,
     let text = next() < 0.3 ? " " : "";
     const len = 1 + Math.floor(next() * 14);
     for (let i = 0; i < len; i++) text += pick(words) + (i < len - 1 ? pick(gaps) : pick(["", ".", "!", " ", "\n"]));
-    if (item.test(text)) continue;
+    if (item.test(text) || bare.test(text)) continue;
     checked++;
     assert.equal(bodyFrom(text), text.trim(), JSON.stringify(text));
     assert.equal(blocksFrom(text), null, JSON.stringify(text));
@@ -104,6 +132,9 @@ test("50,000 spaces, dots, commas or the like format in well under 100 ms", () =
     `${"end list, ".repeat(n / 10)}`,
     `${"- ".repeat(n / 2)}x`,
     `List\n-${" ".repeat(n)}x`,
+    `List\n-${" ".repeat(n)}\nx`,
+    `${"-\n".repeat(n / 2)}x`,
+    `${"- [ ]\n".repeat(n / 6)}x`,
     `${"!?".repeat(n / 2)}x`,
     "\n".repeat(n),
     `a${"\t \n".repeat(n / 3)}b`,

@@ -6,8 +6,22 @@
 
 export type Block = { kind: "text"; text: string } | { kind: "list"; items: string[] };
 
-/** A list item's line: "- " (after any spaces), and its words, without a task box typed by hand. */
-const ITEM = /^\s*-\s+(?:\[ \]\s*)?/;
+/** A list item's line: "- " (after any spaces), and its words, without a task box typed by hand. A dash alone on
+ *  its line (a "- " whose space was trimmed) is an item too, with no words. */
+const ITEM = /^\s*-(?:\s+|$)(?:\[ \]\s*)?/;
+
+/** A line that's only a list mark ("- ", "-" or "- [ ]"): an empty item, which is never a title or a task. Trimmed
+ *  first, not one regex with two runs of spaces, which takes seconds on a long run of them. */
+export function isBareItem(line: string): boolean {
+  const t = line.trim();
+  return t === "-" || /^-\s*\[ \]$/.test(t);
+}
+
+/** `text` without its bare item lines, or `text` itself when it has none. */
+export function withoutBareItems(text: string): string {
+  const lines = text.split("\n");
+  return lines.some(isBareItem) ? lines.filter((l) => !isBareItem(l)).join("\n") : text;
+}
 /** What's trimmed from the end of an item: spaces, full stops and commas. */
 const ITEM_END = /[\s.,;]/;
 
@@ -61,9 +75,9 @@ export function blocksFrom(text: string): Block[] | null {
 }
 
 /** The issue's body, and what Copy copies: the transcript with its "- " lines as GitHub task lists. Without them,
- *  the text exactly as it was, trimmed. */
+ *  the text exactly as it was, trimmed. An empty item ("- " alone on its line) is left out either way. */
 export function bodyFrom(text: string): string {
   const blocks = parseList(text);
-  if (!blocks) return text.trim();
+  if (!blocks) return withoutBareItems(text).trim();
   return blocks.map((b) => (b.kind === "text" ? b.text : b.items.map((i) => `- [ ] ${i}`).join("\n"))).join("\n\n");
 }

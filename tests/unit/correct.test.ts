@@ -79,38 +79,64 @@ test("correct: asks the configured model at temperature 0, with room for the who
 
 // --- Erik's clips and the spike's cases, with the replies Llama gave -------------------------------------
 
-/** [what Flux wrote so far, the newest turn, Llama's reply, the text that should come of it]. */
-const CASES: [string, string, string, string][] = [
-  // c1: "Let's meet on Monday at ten. (pause) No, Tuesday."
-  ["Let's meet on Monday at ten.", "No, Tuesday.", "Let's meet on Tuesday at ten.", "Let's meet on Tuesday at ten."],
-  // c4: "Send the report to Anna. (pause) I mean Hannah." (Flux heard "Henna")
-  ["Send the report to Anna.", "I mean Henna.", "Send the report to Henna.", "Send the report to Henna."],
-  // c6: "The app crashes when I rotate the phone. (pause) Not the phone, the tablet."
-  ["The app crashes when I rotate the phone.", "Wait. Not the phone. The tablet.", "The app crashes when I rotate the tablet.", "The app crashes when I rotate the tablet."],
-  // c2 in one breath: Flux heard it as one turn, and "scratch that" takes only the unfinished sentence.
-  ["", "The login page is slow. It takes ten seconds to load scratch that.", "The login page is slow.", "The login page is slow."],
-  ["Call Mark tomorrow.", "Scratch that. Call him on Friday.", "Call him on Friday.", "Call him on Friday."],
-  ["Users can't upload photos larger than five megabytes.", "Change five to ten.", "Users can't upload photos larger than ten megabytes.", "Users can't upload photos larger than ten megabytes."],
-  // c3 and c5: spoken lists come back as "- " lines.
-  ["", "Shopping list: milk, bread, eggs and butter.", "Shopping list:\n- Milk\n- Bread\n- Eggs\n- Butter", "Shopping list:\n- Milk\n- Bread\n- Eggs\n- Butter"],
-  ["", "To do list. By milk. Call mom.", "To do list:\n- By milk\n- Call mom", "To do list:\n- By milk\n- Call mom"],
-  // Plain sentences that only sound like commands stay as they were said.
-  ["", "No, I don't think the old design was better.", "No, I don't think the old design was better.", "No, I don't think the old design was better."],
-  ["", "Make the list view load faster.", "Make the list view load faster.", "Make the list view load faster."],
-  ["Our cat has a habit.", "She likes to scratch the sofa.", "Our cat has a habit. She likes to scratch the sofa.", "Our cat has a habit. She likes to scratch the sofa."],
-  ["We should add filters.", "No more than three, though.", "We should add filters. No more than three, though.", "We should add filters. No more than three, though."],
-  ["Change the default font.", "Replace it with something easier to read.", "Change the default font. Replace it with something easier to read.", "Change the default font. Replace it with something easier to read."],
-  // "Delete that" on the only sentence leaves nothing, and that's a real answer.
-  ["Add a dark mode.", "Delete that.", "", ""],
-];
-
-test("clips and cases: each of the model's good replies is taken as the new text", async () => {
-  for (const [doc, said, reply, want] of CASES) {
-    const { ai } = model(says(reply));
+/**
+ * One case, as its own test: what Flux wrote so far, the newest turn, Llama's reply (the stand-in's), and the text
+ * that should come of it. Each checks the reply is taken as the new text, so the checks in readFix never throw
+ * away a good edit.
+ */
+function clip(name: string, doc: string, said: string, reply: string, want: string) {
+  test(`clip: ${name}`, async () => {
+    const { ai, calls } = model(says(reply));
     const r = await correct(ai, doc, said);
+    assert.equal(calls.length, 1);
+    assert.deepEqual(calls[0].inputs.messages, fixPrompt(doc, said));
     assert.equal(r.quota, false);
-    assert.deepEqual(r.quota === false && { text: r.text, fixed: r.fixed }, { text: want, fixed: true }, said);
-  }
+    assert.deepEqual(r.quota === false && { text: r.text, fixed: r.fixed }, { text: want, fixed: true });
+  });
+}
+
+// Erik's clips (lab#109 spike).
+clip('c1 (Tuesday): "Let\'s meet on Monday at ten." then "No, Tuesday." gives Tuesday, not both',
+  "Let's meet on Monday at ten.", "No, Tuesday.", "Let's meet on Tuesday at ten.", "Let's meet on Tuesday at ten.");
+// Flux heard "Hannah" as "Henna".
+clip('c4 (Hannah): "Send the report to Anna." then "I mean Hannah." (heard as "Henna") takes Anna\'s place',
+  "Send the report to Anna.", "I mean Henna.", "Send the report to Henna.", "Send the report to Henna.");
+// As Flux heard it: "Wait. Not the phone. The tablet."
+clip('c6 (tablet): "…when I rotate the phone." then "Wait. Not the phone, the tablet." swaps the word',
+  "The app crashes when I rotate the phone.", "Wait. Not the phone. The tablet.", "The app crashes when I rotate the tablet.", "The app crashes when I rotate the tablet.");
+clip('c3 (spoken list): "Shopping list: milk, bread, eggs and butter." becomes a heading and "- " lines',
+  "", "Shopping list: milk, bread, eggs and butter.", "Shopping list:\n- Milk\n- Bread\n- Eggs\n- Butter", "Shopping list:\n- Milk\n- Bread\n- Eggs\n- Butter");
+clip('c5 (spoken list): "To do list. By milk. Call mom." becomes a heading and "- " lines',
+  "", "To do list. By milk. Call mom.", "To do list:\n- By milk\n- Call mom", "To do list:\n- By milk\n- Call mom");
+
+// "Scratch that".
+clip('scratch that in one breath: "…ten seconds to load scratch that." takes only the unfinished sentence',
+  "", "The login page is slow. It takes ten seconds to load scratch that.", "The login page is slow.", "The login page is slow.");
+clip('scratch that, then new words: "Scratch that. Call him on Friday." replaces the last sentence',
+  "Call Mark tomorrow.", "Scratch that. Call him on Friday.", "Call him on Friday.", "Call him on Friday.");
+clip('scratch everything: "Buy milk." then "Scratch that." leaves nothing, and that\'s a real answer',
+  "Buy milk.", "Scratch that.", "", "");
+clip('delete that: "Add a dark mode." then "Delete that." leaves nothing',
+  "Add a dark mode.", "Delete that.", "", "");
+clip('change five to ten: the number changes, and the instruction isn\'t typed',
+  "Users can't upload photos larger than five megabytes.", "Change five to ten.", "Users can't upload photos larger than ten megabytes.", "Users can't upload photos larger than ten megabytes.");
+
+// Plain sentences that only sound like commands stay as they were said.
+clip('sounds like a command: "No, I don\'t think the old design was better." stays as said',
+  "", "No, I don't think the old design was better.", "No, I don't think the old design was better.", "No, I don't think the old design was better.");
+clip('sounds like a command: "Make the list view load faster." stays as said, and isn\'t a list',
+  "", "Make the list view load faster.", "Make the list view load faster.", "Make the list view load faster.");
+clip('sounds like a command: "She likes to scratch the sofa." is added, and scratches nothing',
+  "Our cat has a habit.", "She likes to scratch the sofa.", "Our cat has a habit. She likes to scratch the sofa.", "Our cat has a habit. She likes to scratch the sofa.");
+clip('sounds like a command: "No more than three, though." is added, and corrects nothing',
+  "We should add filters.", "No more than three, though.", "We should add filters. No more than three, though.", "We should add filters. No more than three, though.");
+clip('sounds like a command: "Replace it with something easier to read." is added, and replaces nothing',
+  "Change the default font.", "Replace it with something easier to read.", "Change the default font. Replace it with something easier to read.", "Change the default font. Replace it with something easier to read.");
+
+test("sounds like a command: a reply that took a plain sentence for an edit, and dropped the text, is junk", async () => {
+  // "No more than three, though." isn't a correction: had the model cut the text to it, the plain text is kept.
+  const r = await correct(model(says("No more than three.")).ai, "We should add filters to the search page and the list view.", "No more than three, though.");
+  assert.deepEqual(r.quota === false && { text: r.text, fixed: r.fixed }, { text: "We should add filters to the search page and the list view. No more than three, though.", fixed: false });
 });
 
 // --- junk keeps the turn's plain text ------------------------------------------------------------------

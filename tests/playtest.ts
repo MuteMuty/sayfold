@@ -294,6 +294,19 @@ const LIST_LAST: Step[] = [
   { at: 0.8, type: "text", turn: 1, text: "Shopping list:\n- Milk\n- Bread\n- Eggs\n- Butter\nThen call the bank." },
 ];
 const LISTED = "Shopping list:\n- Milk\n- Bread\n- Eggs\n- Butter\nThen call the bank.";
+/** "Buy milk." then "Scratch that.": the correction model rightly sends empty text. Words came through, and were taken back. */
+const SCRATCH_STEPS: Step[] = [
+  { at: 0.5, type: "update", turn: 0, text: "Buy" },
+  { at: 1.2, type: "end-of-turn", turn: 0, text: "Buy milk." },
+  { at: 1.6, type: "text", turn: 0, text: "Buy milk." },
+  { at: 2.4, type: "update", turn: 1, text: "Scratch" },
+];
+const SCRATCH_LAST: Step[] = [
+  { at: 0, type: "end-of-turn", turn: 1, text: "Scratch that." },
+  { at: 0.8, type: "text", turn: 1, text: "" },
+];
+const SCRATCHED_NOTE = "Everything you said was scratched. Type your idea above, or record again.";
+const SILENCE_TITLE = "No words came through";
 /** Words that lag the audio, as they can: "Water the" (said by about 1.4 s) comes only at 2.1 s, and then the
  *  connection goes, at 2.13 s, while "tomatoes every" is being said. */
 const LAGGING_STEPS: Step[] = [
@@ -946,6 +959,60 @@ for (const [size, viewport, mobile, scheme] of [["desktop", { width: 1280, heigh
     assert.equal(modelRequests(seen).length, 0, "the live path fetched the in-browser model");
     tokenOnlyToGitHub(label, seen);
     console.log(`${label}: "${CORRECTED}", then the list "${LISTED.replace(/\n/g, " / ")}"`);
+    await ctx.close();
+  });
+}
+
+// --- everything scratched isn't silence: an empty review that says so; real silence keeps its own screen ----------
+for (const [size, viewport, mobile, scheme] of [["desktop", { width: 1280, height: 900 }, false, "light"], ["phone", { width: 390, height: 844 }, true, "dark"]] as const) {
+  await check(`scratched, not silence, ${size}`, async () => {
+    const label = `scratched, not silence, ${size}`;
+    const { ctx, page, seen, server } = await openPage(label, { viewport, isMobile: mobile, hasTouch: mobile, colorScheme: scheme, ...(mobile && { deviceScaleFactor: 2 }) }, { live: { status: "available", steps: SCRATCH_STEPS, last: SCRATCH_LAST } });
+    const press = (sel: string) => (mobile ? page.locator(sel).tap() : page.locator(sel).click());
+    await page.waitForFunction(() => window.__sayfold.live().on === true, null, { timeout: 5000 });
+
+    // "Buy milk." shows, then "Scratch that." takes it back.
+    await press("#rec");
+    await waitState(page, ["recording"], 10000);
+    await page.waitForFunction(() => /Buy milk\./.test(document.querySelector("#live-text").textContent), null, { timeout: 8000 });
+    await page.waitForTimeout(1200);
+    await press("#rec");
+    await waitState(page, ["review", "problem"], 15000);
+    assert.equal(await state(page), "review", `"${await page.textContent("#problem-title")}" for words that were scratched`);
+    assert.equal(await page.isVisible("#problem"), false);
+    assert.equal(await page.inputValue("#text"), "");
+    assert.equal(await page.inputValue("#title"), "");
+    assert.equal(await page.isVisible("#scratched"), true, "no line saying everything was scratched");
+    assert.equal((await page.textContent("#scratched")).trim(), SCRATCHED_NOTE);
+    assert.equal(await page.isVisible("#missing"), false);
+    assert.equal(await page.getAttribute("#text", "aria-describedby"), "scratched text-hint");
+    assert.doesNotMatch(await page.evaluate(() => document.body.innerText), /silence|microphone is on/, "the page talks of silence or the microphone");
+    for (const sel of ["#again", "#text"]) assert.equal(await page.isVisible(sel), true, `${sel} isn't there to record again or type`);
+    assert.equal((await liveState(page)).by, "server");
+    await noSideScroll(page, `${label} review`);
+    await shots(page, `${size}-review-scratched`);
+    await page.emulateMedia({ colorScheme: scheme });
+    // Typing works as in any review: the title follows the text.
+    await page.fill("#text", "Buy bread.");
+    assert.equal(await page.inputValue("#title"), "Buy bread");
+
+    // Real silence: no words at all. The silence screen, as before.
+    server.mode.steps = [];
+    server.mode.last = null;
+    await press("#again");
+    await waitState(page, ["recording"], 10000);
+    await page.waitForTimeout(2500);
+    await press("#rec");
+    await waitState(page, ["review", "problem"], 15000);
+    assert.equal(await state(page), "problem", "real silence opened the review");
+    assert.equal(await page.textContent("#problem-title"), SILENCE_TITLE);
+    assert.match(await page.textContent("#problem-body"), /heard only silence/);
+    assert.equal(await page.isVisible("#scratched"), false);
+    await noSideScroll(page, `${label} silence`);
+    await shots(page, `${size}-problem-silence`);
+    assert.equal(server.connections.length, 2);
+    assert.equal(modelRequests(seen).length, 0, "the live path fetched the in-browser model");
+    console.log(`${label}: scratched gives the empty review, silence the silence screen`);
     await ctx.close();
   });
 }

@@ -161,6 +161,8 @@ let session: LiveSession | null = null;
 let resampler: StreamResampler | null = null;
 /** How the last recording's live text ended (null when it had none). */
 let liveEnd: LiveEnd | null = null;
+/** Whether the last recording's words were heard and then all scratched (empty, but not silence). */
+let liveScratched = false;
 /** Whether audio of the recording on screen went to the server: until the next one starts, the line says so. */
 let liveSent = false;
 /** Seconds of the last recording given to the in-browser model, for the playtest. */
@@ -234,6 +236,7 @@ async function start() {
   // doesn't hold it open.
   const live = (await statusCheck) && liveOn !== false;
   liveEnd = null;
+  liveScratched = false;
   // A new recording: the line is about this one now, which stays on this device unless it's live.
   liveSent = false;
   renderPromise();
@@ -276,6 +279,7 @@ async function stop(capped = false) {
     if (resampler) s.push(resampler.flush());
     // Stop, then the server's last words and its close.
     liveEnd = await s.finish();
+    liveScratched = s.scratched;
     liveSent = s.sentAudio;
     session = null;
     renderPromise();
@@ -309,14 +313,16 @@ async function transcribe() {
 }
 
 function finish(rec: Recording, text: string, by: Finisher, gaps: boolean) {
-  if (!text.trim()) {
+  // Nothing at all: silence, unless words were heard and spoken edits took them all back. Then it's an empty
+  // review that says so, never the microphone message.
+  if (!text.trim() && !liveScratched) {
     plays.abandoned();
     showProblem("empty");
     return;
   }
   finishedBy = by;
   plays.finished(rec.seconds, by);
-  showReview(text.trim(), gaps);
+  showReview(text.trim(), gaps, !text.trim());
 }
 
 // --- review ----------------------------------------------------------------------------------
@@ -324,17 +330,20 @@ function finish(rec: Recording, text: string, by: Finisher, gaps: boolean) {
 let titleFollows = true;
 
 const missingNote = $("#missing");
+const scratchedNote = $("#scratched");
 
-function showReview(text: string, gaps = false) {
+/** The review. `scratched`: every word said was taken back, so the text is empty and the page says why. */
+function showReview(text: string, gaps = false, scratched = false) {
   textIn.value = text;
   titleIn.value = titleFrom(text);
   titleFollows = true;
   missingNote.hidden = !gaps;
+  scratchedNote.hidden = !scratched;
   // A hidden note would still be read as the description, so it's only linked while it shows.
-  textIn.setAttribute("aria-describedby", gaps ? "missing text-hint" : "text-hint");
+  textIn.setAttribute("aria-describedby", [scratched && "scratched", gaps && "missing", "text-hint"].filter(Boolean).join(" "));
   renderPreview();
   setState("review");
-  say(gaps ? `Your idea is ready to review. ${missingNote.textContent}` : "Your idea is ready to review");
+  say(scratched ? scratchedNote.textContent! : gaps ? `Your idea is ready to review. ${missingNote.textContent}` : "Your idea is ready to review");
   textIn.focus();
   textIn.setSelectionRange(text.length, text.length);
   renderSend();

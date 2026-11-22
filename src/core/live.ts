@@ -80,8 +80,11 @@ export class LiveText {
   private turns = new Map<number, Part>();
   /** The whole text up to and including `turn`, with spoken edits made. */
   private fixed: { turn: number; text: string } | null = null;
+  /** Whether any words were heard, corrected away since or not. */
+  private heard = false;
 
   receive(m: Extract<ServerMessage, { turn: number }>): void {
+    if (m.type !== "text" && m.text.trim()) this.heard = true;
     if (m.type === "text") {
       if (this.fixed && this.fixed.turn >= m.turn) return;
       this.fixed = { turn: m.turn, text: m.text.trim() };
@@ -100,6 +103,11 @@ export class LiveText {
 
   get text(): string {
     return this.parts.reduce((text, p) => joinTurn(text, p.text), "");
+  }
+
+  /** Words were heard, and spoken edits ("scratch that") took all of them back: empty, but not silence. */
+  get scratched(): boolean {
+    return this.heard && this.fixed !== null && this.text === "";
   }
 }
 
@@ -248,6 +256,11 @@ export class LiveSession {
       }
     }
     this.flush();
+  }
+
+  /** Whether the server heard words and the speaker's spoken edits took all of them back. */
+  get scratched(): boolean {
+    return this.live.scratched;
   }
 
   /** Whether any of the recording's audio went to the server. */

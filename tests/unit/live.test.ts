@@ -130,6 +130,40 @@ test("spoken corrections: \"scratch that\" can leave nothing, and a spoken list'
   assert.equal(t.text, "Shopping list:\n- Milk\n- Bread\n- Eggs\n- Butter\nThen call the bank.");
 });
 
+test("empty text: words heard and then all scratched are told apart from silence", () => {
+  // "Buy milk." then "Scratch that.": the correction model rightly sends empty text.
+  const t = new LiveText();
+  assert.equal(t.scratched, false, "nothing yet");
+  t.receive({ type: "update", turn: 0, text: "Buy" });
+  t.receive({ type: "end-of-turn", turn: 0, text: "Buy milk." });
+  t.receive({ type: "text", turn: 0, text: "Buy milk." });
+  assert.equal(t.scratched, false, "words on screen");
+  t.receive({ type: "end-of-turn", turn: 1, text: "Scratch that." });
+  t.receive({ type: "text", turn: 1, text: "" });
+  assert.equal(t.text, "");
+  assert.equal(t.scratched, true);
+  // Words said after it are no longer scratched.
+  t.receive({ type: "update", turn: 2, text: "Buy bread" });
+  assert.equal(t.scratched, false);
+
+  // "Buy milk scratch that." in one breath: one turn, and its correction is empty.
+  const breath = new LiveText();
+  breath.receive({ type: "end-of-turn", turn: 0, text: "Buy milk scratch that." });
+  breath.receive({ type: "text", turn: 0, text: "" });
+  assert.equal(breath.scratched, true);
+
+  // Real silence: no words at all, or turns that ended empty, and no correction. That's not "scratched".
+  const silence = new LiveText();
+  assert.equal(silence.scratched, false);
+  silence.receive({ type: "update", turn: 0, text: "" });
+  silence.receive({ type: "end-of-turn", turn: 0, text: "  " });
+  assert.equal(silence.text, "");
+  assert.equal(silence.scratched, false);
+  // A correction of nothing to nothing isn't a scratch either.
+  silence.receive({ type: "text", turn: 0, text: "" });
+  assert.equal(silence.scratched, false);
+});
+
 test("joining the live text and the in-browser model's text", () => {
   assert.equal(joinText("Water the tomatoes.", " And call the plumber. "), "Water the tomatoes. And call the plumber.");
   // Mid-sentence, the in-browser model's capital goes (it starts every part with one), but not a name's or "I"'s.
@@ -295,6 +329,29 @@ test("live: a correction replaces the words on screen, and stop waits for the cl
     "Let's meet on Tuesday at ten.",
   ]);
   assert.deepEqual(await end, { text: "Let's meet on Tuesday at ten.", from: null, exact: true, reason: null });
+});
+
+test("live: a recording whose words were all scratched says so; silence doesn't", async () => {
+  const { ws, live } = session();
+  ws.open();
+  live.push(tone(1));
+  ws.say({ type: "end-of-turn", turn: 0, text: "Buy milk." });
+  ws.say({ type: "text", turn: 0, text: "Buy milk." });
+  live.push(tone(1));
+  ws.say({ type: "end-of-turn", turn: 1, text: "Scratch that." });
+  const end = live.finish();
+  ws.say({ type: "text", turn: 1, text: "" });
+  ws.hangUp();
+  assert.deepEqual(await end, { text: "", from: null, exact: true, reason: null });
+  assert.equal(live.scratched, true);
+
+  const quiet = session();
+  quiet.ws.open();
+  quiet.live.push(tone(2, 0));
+  const ended = quiet.live.finish();
+  quiet.ws.hangUp();
+  assert.deepEqual(await ended, { text: "", from: null, exact: true, reason: null });
+  assert.equal(quiet.live.scratched, false);
 });
 
 test("live: a correction isn't new words: where the in-browser model takes over still follows the last words", async () => {

@@ -1,11 +1,12 @@
 // The title filled in from the transcript, and what Copy puts on the clipboard.
-import { bodyFrom, parseList, trimEndOf } from "./list.ts";
+import { bodyFrom, isBareItem, parseList, trimEndOf } from "./list.ts";
 
 export const TITLE_MAX = 72;
 const MIN_CLAUSE = 6;
 
 /** The first line, or its first sentence when the transcript is one paragraph, capitalised; a long one ends at a clause break or a word.
- * With a task list, the words before it ("Shopping list:\n- Milk" gives "Shopping list"), or its first item when it comes first. */
+ * With a task list, the words before it ("Shopping list:\n- Milk" gives "Shopping list"), or its first item when it comes first.
+ * An empty item ("- " alone on its line) is never the title. */
 export function titleFrom(text: string): string {
   const blocks = parseList(text);
   if (!blocks) return firstTitle(text);
@@ -15,7 +16,8 @@ export function titleFrom(text: string): string {
 }
 
 function firstTitle(text: string): string {
-  const line = text.split("\n").map((l) => l.trim()).find((l) => l.length > 0) ?? "";
+  // An empty list item ("- " alone on its line) is skipped, so the title is never "-".
+  const line = text.split("\n").map((l) => l.trim()).find((l) => l.length > 0 && !isBareItem(l)) ?? "";
   // A sentence ends at . ! or ? followed by a space. A full stop is dropped; ! and ? are kept.
   const end = line.search(/[.!?](\s|$)/);
   let t = end < 0 ? line : line[end] === "." ? line.slice(0, end) : line.slice(0, end + 1);
