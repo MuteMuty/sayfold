@@ -20,6 +20,11 @@ export { isQuotaRefusal };
 
 /** The part of a Workers WebSocket used here. */
 export interface Socket {
+  /**
+   * Set to "arraybuffer" on both ends. From compatibility date 2026-11-01 Workers' WebSockets are standard, and
+   * binary frames arrive as Blobs by default, which this code would drop: the page's audio then never reached Flux.
+   */
+  binaryType: "blob" | "arraybuffer";
   accept(): void;
   send(data: string | ArrayBuffer | ArrayBufferView): void;
   close(code?: number, reason?: string): void;
@@ -84,6 +89,7 @@ async function listen(request: Request, rt: Runtime): Promise<Response> {
   if (!allowedOrigin(request.headers.get("origin"))) return new Response("Not allowed.", { status: 403 });
   const [client, server] = rt.pair();
   server.accept();
+  server.binaryType = "arraybuffer";
   await new Session(server, rt).start(ipOf(request));
   return rt.upgrade(client);
 }
@@ -163,6 +169,7 @@ class Session {
     if (!this.flux) return this.end("error");
     const flux = this.flux;
     flux.accept();
+    flux.binaryType = "arraybuffer";
     flux.addEventListener("message", (e) => this.fromFlux(e.data));
     flux.addEventListener("close", () => (this.state === "draining" || this.state === "settling" ? this.settle() : this.end("error")));
     flux.addEventListener("error", () => this.end("error"));
