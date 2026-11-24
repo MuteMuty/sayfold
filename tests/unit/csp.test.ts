@@ -5,6 +5,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { CSP, directives } from "../../src/csp.ts";
 import { ORIGINS } from "../../src/server/config.ts";
+import { listenUrl } from "../../src/core/live.ts";
+import { allowedOrigin } from "../../src/server/listen.ts";
 
 const policy = (csp: string) => new Map(csp.split(";").map((d) => d.trim().split(/\s+/)).filter((d) => d[0]).map(([k, ...v]) => [k!, v]));
 
@@ -17,6 +19,16 @@ test("connect-src allows only Sayfold itself (its live-text WebSocket named too)
 
 test("the WebSocket addresses are exactly the Worker's own origins, on wss:", () => {
   assert.deepEqual(policy(CSP).get("connect-src")!.filter((v) => v.startsWith("wss:")), ORIGINS.map((o) => o.replace(/^https:/, "wss:")));
+});
+
+test("on the launch address and on workers.dev, the page may open its own live-text socket, and the Worker takes it", () => {
+  const connect = policy(CSP).get("connect-src")!;
+  for (const host of ["sayfold.brightloopapps.com", "sayfold.erko-erka1.workers.dev"]) {
+    const url = new URL(listenUrl({ protocol: "https:", host }));
+    assert.equal(url.href, `wss://${host}/api/listen`);
+    assert.ok(connect.includes(url.origin), `connect-src doesn't name ${url.origin}`);
+    assert.ok(allowedOrigin(`https://${host}`), `the Worker refuses the page on ${host}`);
+  }
 });
 
 test("everything else defaults to Sayfold itself, with nothing to embed and no forms to post", () => {

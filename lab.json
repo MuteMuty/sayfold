@@ -1,6 +1,6 @@
 {
   "name": "sayfold",
-  "url": "https://sayfold.erko-erka1.workers.dev",
+  "url": "https://sayfold.brightloopapps.com",
   "worker": "sayfold",
   "commands": {
     "install": "npm ci",

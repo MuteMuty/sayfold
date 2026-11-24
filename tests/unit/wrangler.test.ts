@@ -12,14 +12,14 @@ const config = JSON.parse(
   readFileSync(join(root, "wrangler.jsonc"), "utf8").split("\n").filter((l) => !l.trim().startsWith("//")).join("\n"),
 );
 
-test("wrangler.jsonc: a TypeScript Worker that still serves dist/ on workers.dev, with no routes", () => {
+test("wrangler.jsonc: a TypeScript Worker that serves dist/ on workers.dev and on its launch address", () => {
   assert.equal(config.name, "sayfold");
   assert.match(config.main, /\.ts$/);
   assert.ok(existsSync(join(root, config.main)));
   assert.match(readFileSync(join(root, config.main), "utf8"), /export class Meter extends DurableObject/);
   assert.deepEqual(config.assets, { directory: "./dist", binding: "ASSETS" });
   assert.equal(config.workers_dev, true);
-  assert.equal(config.routes, undefined);
+  assert.deepEqual(config.routes, [{ pattern: "sayfold.brightloopapps.com", custom_domain: true }], "exactly one route: the custom domain");
   assert.equal(config.route, undefined);
 });
 
@@ -34,4 +34,10 @@ test("wrangler.jsonc: no logs, analytics, secrets or other storage to set up", (
   for (const key of ["kv_namespaces", "d1_databases", "r2_buckets", "analytics_engine_datasets", "logpush", "tail_consumers", "vars", "secrets_store_secrets", "queues"]) {
     assert.equal(config[key], undefined, key);
   }
+});
+
+test("lab.json points at the launch address", () => {
+  const lab = JSON.parse(readFileSync(join(root, "lab.json"), "utf8"));
+  assert.equal(lab.url, "https://sayfold.brightloopapps.com");
+  assert.equal(lab.worker, config.name);
 });
