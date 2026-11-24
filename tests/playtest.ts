@@ -813,8 +813,27 @@ for (const [size, viewport, mobile, scheme] of [["desktop", { width: 1280, heigh
     assert.equal(await page.isVisible("#promise"), true);
     assert.match(await page.getAttribute("#rec", "aria-describedby"), /\bpromise\b/);
     assert.equal(await page.isVisible("#live"), false, "the live text shows before recording");
-    const meta = await page.evaluate(() => [...document.querySelectorAll("meta[name=description], meta[property='og:description'], .gh-intro")].map((m) => m.getAttribute("content") ?? m.textContent).join(" "));
-    assert.doesNotMatch(meta, /never leaves|no server|on your device|in your browser/i, meta);
+    const meta = await page.evaluate(() => [...document.querySelectorAll("meta[name=description], meta[property^='og:'], meta[name^='twitter:'], .gh-intro")].map((m) => m.getAttribute("content") ?? m.textContent).join(" "));
+    assert.doesNotMatch(meta, /never leaves|no server|on your device|on this device|in your browser/i, meta);
+    // Share previews for the launch address (lab#74), and the card they point at, served by Sayfold itself.
+    const share = await page.evaluate(async () => {
+      const m = (k: string) => document.querySelector(`meta[property='${k}'], meta[name='${k}']`)?.getAttribute("content") ?? null;
+      const img = new Image();
+      img.src = "/og.png";
+      await img.decode().catch(() => {});
+      return {
+        canonical: document.querySelector("link[rel=canonical]")?.getAttribute("href") ?? null,
+        type: m("og:type"), url: m("og:url"), title: m("og:title"), description: m("og:description"), image: m("og:image"),
+        width: m("og:image:width"), height: m("og:image:height"), alt: m("og:image:alt"), card: m("twitter:card"),
+        png: [img.naturalWidth, img.naturalHeight],
+      };
+    });
+    assert.deepEqual(share, {
+      canonical: "https://sayfold.brightloopapps.com/", type: "website", url: "https://sayfold.brightloopapps.com/", title: "Sayfold",
+      description: "Say an idea, get it as text, and send it to your own GitHub repo.", image: "https://sayfold.brightloopapps.com/og.png",
+      width: "1200", height: "630", alt: share.alt, card: "summary_large_image", png: [1200, 630],
+    });
+    assert.match(share.alt, /^Sayfold: /);
 
     await press("#rec");
     await waitState(page, ["recording"], 10000);
